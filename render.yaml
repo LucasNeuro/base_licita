@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: pncp-licitacoes-api
+    env: python
+    region: oregon
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: HORARIO_EXTRACAO
+        value: "06:00"
+      - key: HOST
+        value: "0.0.0.0"
+      - key: PORT
+        fromGroup: web
+      - key: DEBUG
+        value: "false"
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+    healthCheckPath: /
+
