@@ -368,6 +368,7 @@ def mapear_para_supabase(contratacao: dict, detalhes: dict) -> dict:
         "orgao_razao_social": contratacao.get('orgaoEntidade', {}).get('razaoSocial'),
         "uf_sigla": contratacao.get('unidadeOrgao', {}).get('ufSigla'),
         "modalidade_nome": contratacao.get('modalidadeNome'),
+        "link_portal_pncp": link_portal,  # ⭐ Link do portal em coluna dedicada
         "dados_completos": dados_completos_com_link,  # JSON completo com link
         "itens": detalhes.get('itens', []),
         "anexos": documentos_com_links,  # Documentos com link do portal
