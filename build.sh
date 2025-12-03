@@ -3,9 +3,10 @@
 
 set -o errexit
 
-echo "🔨 Instalando dependências..."
+echo "🔨 Atualizando pip..."
 pip install --upgrade pip
+
+echo "📦 Instalando dependências..."
 pip install -r requirements.txt
 
 echo "✅ Build concluído com sucesso!"
-
