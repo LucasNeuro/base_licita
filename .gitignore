@@ -56,3 +56,11 @@ htmlcov/
 temp/
 tmp/
 
+# Arquivos de teste e verificação
+resultado_edital_teste.json
+dados_salvos_verificacao_*.json
+teste_*.py
+
+
+
+

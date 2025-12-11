@@ -13,6 +13,7 @@ from apscheduler.triggers.cron import CronTrigger
 import requests
 from supabase import create_client, Client
 import logging
+import copy
 
 # Rich para console bonito
 from rich.console import Console
@@ -350,9 +351,50 @@ def mapear_para_supabase(contratacao: dict, detalhes: dict) -> dict:
         except:
             pass
     
-    # Adiciona link do portal aos dados completos e documentos
-    dados_completos_com_link = contratacao.copy()
-    dados_completos_com_link['link_portal_pncp'] = link_portal
+    # Prepara dados_completos com TODAS as informações da API
+    # IMPORTANTE: Fazemos uma cópia profunda para preservar TODOS os campos da API
+    # Isso garante que nenhum campo seja perdido, incluindo campos que podem não estar
+    # documentados mas que a API retorna (ex: existeResultado, fontesOrcamentarias, etc)
+    dados_completos = copy.deepcopy(contratacao)
+    
+    # Adiciona link do portal (não sobrescreve se já existir)
+    if link_portal:
+        dados_completos['link_portal_pncp'] = link_portal
+    
+    # Garante que as datas de abertura e encerramento estejam no formato correto
+    # A API pode retornar em diferentes formatos, normalizamos para ISO 8601
+    data_abertura = contratacao.get('dataAberturaProposta')
+    data_encerramento = contratacao.get('dataEncerramentoProposta')
+    
+    # Se as datas vierem como string, mantém; se vierem como objeto datetime, converte
+    if data_abertura:
+        if isinstance(data_abertura, str):
+            dados_completos['dataAberturaProposta'] = data_abertura
+        else:
+            # Se for datetime ou outro formato, converte para ISO string
+            dados_completos['dataAberturaProposta'] = str(data_abertura)
+    else:
+        # Garante que o campo exista mesmo se for None
+        dados_completos['dataAberturaProposta'] = None
+    
+    if data_encerramento:
+        if isinstance(data_encerramento, str):
+            dados_completos['dataEncerramentoProposta'] = data_encerramento
+        else:
+            dados_completos['dataEncerramentoProposta'] = str(data_encerramento)
+    else:
+        # Garante que o campo exista mesmo se for None
+        dados_completos['dataEncerramentoProposta'] = None
+    
+    # NOTA: Não precisamos adicionar campos explicitamente porque já copiamos
+    # TODOS os campos da API com copy.deepcopy(). Isso garante que campos como:
+    # - existeResultado
+    # - dataInclusao, dataAtualizacao, dataAtualizacaoGlobal
+    # - fontesOrcamentarias
+    # - orcamentoSigilosoCodigo, orcamentoSigilosoDescricao
+    # - tipoInstrumentoConvocatorioCodigo
+    # - linkProcessoEletronico
+    # E todos os outros campos retornados pela API sejam preservados automaticamente
     
     # Adiciona link do portal em cada documento também
     documentos_com_links = detalhes.get('documentos', []).copy()
@@ -365,11 +407,11 @@ def mapear_para_supabase(contratacao: dict, detalhes: dict) -> dict:
         "objeto_compra": contratacao.get('objetoCompra'),
         "valor_total_estimado": float(valor_total) if valor_total else None,
         "data_publicacao_pncp": contratacao.get('dataPublicacaoPncp'),
-        "orgao_razao_social": contratacao.get('orgaoEntidade', {}).get('razaoSocial'),
+        "orgao_razao_social": contratacao.get('orgaoEntidade', {}).get('razaoSocial') or contratacao.get('orgaoEntidade', {}).get('razaosocial'),
         "uf_sigla": contratacao.get('unidadeOrgao', {}).get('ufSigla'),
         "modalidade_nome": contratacao.get('modalidadeNome'),
         "link_portal_pncp": link_portal,  # ⭐ Link do portal em coluna dedicada
-        "dados_completos": dados_completos_com_link,  # JSON completo com link
+        "dados_completos": dados_completos,  # JSON completo com TODAS as informações
         "itens": detalhes.get('itens', []),
         "anexos": documentos_com_links,  # Documentos com link do portal
         "historico": detalhes.get('historico', []),
@@ -377,7 +419,7 @@ def mapear_para_supabase(contratacao: dict, detalhes: dict) -> dict:
     }
 
 def salvar_no_supabase(dados: dict) -> bool:
-    """Salva ou atualiza licitação no Supabase (evita duplicatas)"""
+    """Salva ou atualiza licitação no Supabase (evita duplicatas e preserva dados existentes)"""
     
     if not SUPABASE_ENABLED:
         # Modo teste - apenas loga
@@ -388,14 +430,24 @@ def salvar_no_supabase(dados: dict) -> bool:
     try:
         numero_controle = dados['numero_controle_pncp']
         
-        # Verifica se já existe
+        # Verifica se já existe e busca dados_completos existente
         resultado = supabase.table(SupabaseConfig.TABLE_NAME)\
-            .select('id')\
+            .select('id, dados_completos')\
             .eq('numero_controle_pncp', numero_controle)\
             .execute()
         
-        if resultado.data:
-            # Atualiza registro existente
+        if resultado.data and len(resultado.data) > 0:
+            # Atualiza registro existente - preserva dados_completos existentes
+            existente = resultado.data[0]
+            dados_completos_existente = existente.get('dados_completos') or {}
+            
+            # Faz merge dos dados_completos: preserva existentes e atualiza com novos
+            if 'dados_completos' in dados:
+                dados_completos_novo = dados['dados_completos'] or {}
+                # Merge: dados existentes primeiro, depois novos (novos sobrescrevem)
+                dados['dados_completos'] = {**dados_completos_existente, **dados_completos_novo}
+            
+            # Atualiza registro
             supabase.table(SupabaseConfig.TABLE_NAME)\
                 .update(dados)\
                 .eq('numero_controle_pncp', numero_controle)\
