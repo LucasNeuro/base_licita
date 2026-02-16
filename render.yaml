@@ -12,6 +12,8 @@ services:
         sync: false
       - key: SUPABASE_KEY
         sync: false
+      - key: MISTRAL_API_KEY
+        sync: false
       - key: HORARIO_EXTRACAO
         value: "06:00"
       - key: HOST

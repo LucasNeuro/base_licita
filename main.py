@@ -14,6 +14,7 @@ import requests
 from supabase import create_client, Client
 import logging
 import copy
+import asyncio
 
 # Rich para console bonito
 from rich.console import Console
@@ -32,8 +33,12 @@ from config import (
     ServerConfig,
     LogConfig,
     ModalidadesConfig,
-    exibir_configuracoes
+    exibir_configuracoes,
+    MistralConfig
 )
+
+# Importar classificador
+from classificador import ClassificadorIA
 
 # Configuração de logs
 logging.basicConfig(
@@ -104,6 +109,17 @@ class ExtrairManualRequest(BaseModel):
             }
         }
 
+class ClassificarRequest(BaseModel):
+    """Modelo para requisição de classificação manual"""
+    limite: int = 50  # Quantas licitações processar
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "limite": 50
+            }
+        }
+
 # ============================================================================
 # FASTAPI APP
 # ============================================================================
@@ -122,6 +138,9 @@ scheduler_config = {
     "dias_atras": SchedulerConfig.DIAS_ATRAS,
     "limite_paginas": None  # None = SEM LIMITE (busca tudo!)
 }
+
+# Tamanho do lote na classificação (Supabase/PostgREST costuma limitar ~1000 linhas por request)
+CLASSIFICACAO_BATCH_SIZE = 1000
 
 # ============================================================================
 # FUNÇÕES DE PERSISTÊNCIA DE CONFIGURAÇÃO
@@ -760,8 +779,55 @@ def tarefa_extracao_automatica():
             limite_paginas=limite_paginas
         )
         logger.info(f"✅ Extração automática concluída: {resultado['total_salvos']} registros salvos de {resultado['total_encontrados']} encontrados")
+        
+        # Após extração, roda classificação automática se houver novos registros
+        if resultado['total_salvos'] > 0 and MistralConfig.is_configured():
+            logger.info("🧠 Iniciando classificação automática de licitações...")
+            asyncio.run(tarefa_classificacao_automatica())
+            
     except Exception as e:
         logger.error(f"❌ Erro na extração automática: {str(e)}")
+
+async def tarefa_classificacao_automatica():
+    """Tarefa de classificação automática - PROCESSA TODAS AS LICITAÇÕES PENDENTES"""
+    try:
+        if not SUPABASE_ENABLED:
+            logger.warning("⚠️ Supabase não conectado - pulando classificação")
+            return
+
+        classificador = ClassificadorIA(supabase)
+        
+        # Primeiro, conta quantas licitações pendentes existem
+        from classificador import SupabaseConfig
+        
+        response = supabase.table(SupabaseConfig.TABLE_NAME)\
+            .select("id", count='exact')\
+            .is_("subsetor_principal_id", "null")\
+            .execute()
+        
+        total_pendentes = response.count if hasattr(response, 'count') else 0
+        
+        if total_pendentes == 0:
+            logger.info("🎉 Nenhuma licitação pendente de classificação")
+            return
+            
+        logger.info(f"🧠 Iniciando classificação automática de {total_pendentes} licitações pendentes (em lotes de {CLASSIFICACAO_BATCH_SIZE})...")
+        
+        # Processa em lotes até não haver mais pendentes (cobre a base toda)
+        total_stats = {"processados": 0, "sucessos": 0, "falhas": 0}
+        while True:
+            stats = await classificador.classificar_pendentes(limite=CLASSIFICACAO_BATCH_SIZE)
+            processados = stats.get("processados", 0)
+            if processados == 0:
+                break
+            total_stats["processados"] += processados
+            total_stats["sucessos"] += stats.get("sucessos", 0)
+            total_stats["falhas"] += stats.get("falhas", 0)
+            logger.info(f"   Lote: {stats} | Acumulado: {total_stats}")
+        logger.info(f"✅ Classificação automática concluída: {total_stats}")
+        
+    except Exception as e:
+        logger.error(f"❌ Erro na classificação automática: {str(e)}")
 
 # ============================================================================
 # ENDPOINTS
@@ -1011,6 +1077,76 @@ def extrair_manual(request: ExtrairManualRequest, background_tasks: BackgroundTa
         logger.error(f"Erro na extração manual: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/classificar/manual")
+async def classificar_manual(request: ClassificarRequest, background_tasks: BackgroundTasks):
+    """
+    Classifica licitações manualmente usando IA
+    """
+    if not SUPABASE_ENABLED:
+        raise HTTPException(status_code=503, detail="Supabase não conectado")
+        
+    if not MistralConfig.is_configured():
+        raise HTTPException(status_code=503, detail="Mistral AI não configurada (MISTRAL_API_KEY ausente)")
+    
+    async def processar_background(limite: int):
+        classificador = ClassificadorIA(supabase)
+        await classificador.classificar_pendentes(limite)
+        
+    background_tasks.add_task(processar_background, request.limite)
+    
+    return {
+        "sucesso": True,
+        "mensagem": f"Classificação iniciada em background (limite={request.limite})"
+    }
+
+@app.post("/classificar/todas")
+async def classificar_todas(background_tasks: BackgroundTasks):
+    """
+    Classifica TODAS as licitações pendentes usando IA (sem limite)
+    """
+    if not SUPABASE_ENABLED:
+        raise HTTPException(status_code=503, detail="Supabase não conectado")
+        
+    if not MistralConfig.is_configured():
+        raise HTTPException(status_code=503, detail="Mistral AI não configurada (MISTRAL_API_KEY ausente)")
+    
+    async def processar_todas():
+        classificador = ClassificadorIA(supabase)
+        
+        # Conta quantas licitações pendentes existem
+        response = supabase.table(SupabaseConfig.TABLE_NAME)\
+            .select("id", count='exact')\
+            .is_("subsetor_principal_id", "null")\
+            .execute()
+        
+        total_pendentes = response.count if hasattr(response, 'count') else 0
+        
+        if total_pendentes == 0:
+            logger.info("🎉 Nenhuma licitação pendente de classificação")
+            return
+            
+        logger.info(f"🧠 Iniciando classificação de {total_pendentes} licitações pendentes (em lotes de {CLASSIFICACAO_BATCH_SIZE})...")
+        
+        # Processa em lotes até não haver mais pendentes (cobre a base toda)
+        total_stats = {"processados": 0, "sucessos": 0, "falhas": 0}
+        while True:
+            stats = await classificador.classificar_pendentes(limite=CLASSIFICACAO_BATCH_SIZE)
+            processados = stats.get("processados", 0)
+            if processados == 0:
+                break
+            total_stats["processados"] += processados
+            total_stats["sucessos"] += stats.get("sucessos", 0)
+            total_stats["falhas"] += stats.get("falhas", 0)
+            logger.info(f"   Lote: {stats} | Acumulado: {total_stats}")
+        logger.info(f"✅ Classificação concluída: {total_stats}")
+        
+    background_tasks.add_task(processar_todas)
+    
+    return {
+        "sucesso": True,
+        "mensagem": "Classificação de TODAS as licitações iniciada em background"
+    }
+
 @app.get("/config")
 def ver_configuracoes():
     """
@@ -1134,6 +1270,17 @@ def estatisticas():
     except Exception as e:
         logger.error(f"Erro ao buscar estatísticas: {str(e)}")
         return {"erro": str(e)}
+
+@app.get("/health/db")
+def health_db():
+    if not SUPABASE_ENABLED:
+        return {"conectado": False, "motivo": "supabase_nao_configurado"}
+    try:
+        resp = supabase.table(SupabaseConfig.TABLE_NAME).select('id', count='exact').limit(1).execute()
+        qtd = resp.count if hasattr(resp, 'count') else None
+        return {"conectado": True, "tabela": SupabaseConfig.TABLE_NAME, "ok": True, "quantidade": qtd}
+    except Exception as e:
+        return {"conectado": True, "ok": False, "erro": str(e)}
 
 # ============================================================================
 # INICIALIZAÇÃO

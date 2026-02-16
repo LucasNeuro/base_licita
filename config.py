@@ -73,6 +73,23 @@ class PNCPConfig:
 # CONFIGURAÇÕES DO SCHEDULER
 # ============================================================================
 
+class MistralConfig:
+    """Configurações da Mistral AI"""
+    
+    # Chave de API
+    API_KEY = os.getenv("MISTRAL_API_KEY", "")
+    
+    # Modelo a ser utilizado
+    MODEL = os.getenv("MISTRAL_MODEL", "mistral-large-latest")
+    
+    # Temperatura (criatividade vs determinismo)
+    TEMPERATURE = 0.2
+    
+    @classmethod
+    def is_configured(cls) -> bool:
+        """Verifica se a Mistral está configurada"""
+        return bool(cls.API_KEY and cls.API_KEY != "")
+
 class SchedulerConfig:
     """Configurações do agendador automático"""
     
@@ -247,6 +264,7 @@ def exibir_configuracoes():
 __all__ = [
     'SupabaseConfig',
     'PNCPConfig',
+    'MistralConfig',
     'SchedulerConfig',
     'ServerConfig',
     'LogConfig',
