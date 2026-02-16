@@ -127,10 +127,7 @@ class ClassificarRequest(BaseModel):
 app = FastAPI(
     title=ServerConfig.APP_NAME,
     description=ServerConfig.DESCRIPTION,
-    version=ServerConfig.VERSION,
-    openapi_tags=[
-        {"name": "Classificação (IA)", "description": "Endpoints para classificar licitações por setor/subsetor usando Mistral AI"}
-    ]
+    version=ServerConfig.VERSION
 )
 
 scheduler = BackgroundScheduler()
@@ -1070,11 +1067,11 @@ def extrair_manual(request: ExtrairManualRequest, background_tasks: BackgroundTa
         logger.error(f"Erro na extração manual: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/classificar/manual", tags=["Classificação (IA)"])
+@app.post("/classificar/manual", tags=["Classificação"])
 async def classificar_manual(request: ClassificarRequest, background_tasks: BackgroundTasks):
     """
-    Classifica licitações pendentes usando IA (Mistral). Envia limite de quantas processar.
-    Requer MISTRAL_API_KEY e Supabase com tabelas setores/subsetores e licitacoes_classificacao.
+    Classifica licitações manualmente usando IA (Mistral). Processa em background.
+    Requer MISTRAL_API_KEY configurada e Supabase com setores/subsetores.
     """
     if not SUPABASE_ENABLED:
         raise HTTPException(status_code=503, detail="Supabase não conectado")
@@ -1093,11 +1090,11 @@ async def classificar_manual(request: ClassificarRequest, background_tasks: Back
         "mensagem": f"Classificação iniciada em background (limite={request.limite})"
     }
 
-@app.post("/classificar/todas", tags=["Classificação (IA)"])
+@app.post("/classificar/todas", tags=["Classificação"])
 async def classificar_todas(background_tasks: BackgroundTasks):
     """
-    Classifica TODAS as licitações pendentes (subsetor_principal_id nulo) usando IA. Sem limite.
-    Requer MISTRAL_API_KEY. Execução em background.
+    Classifica TODAS as licitações pendentes (subsetor_principal_id nulo) usando IA.
+    Processa em background, sem limite. Requer MISTRAL_API_KEY e Supabase.
     """
     if not SUPABASE_ENABLED:
         raise HTTPException(status_code=503, detail="Supabase não conectado")
@@ -1282,11 +1279,6 @@ def startup_event():
     
     if SUPABASE_ENABLED:
         logger.info("✅ API pronta para uso com Supabase!")
-        logger.info("📌 Endpoints de classificação (IA): POST /classificar/manual, POST /classificar/todas")
-        if MistralConfig.is_configured():
-            logger.info("🧠 Mistral AI configurada — classificação por IA disponível")
-        else:
-            logger.warning("⚠️ MISTRAL_API_KEY não definida — classificação por IA indisponível")
         
         # Carrega configuração do scheduler do banco
         logger.info("📥 Carregando configuração do scheduler do banco...")
