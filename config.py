@@ -76,8 +76,8 @@ class PNCPConfig:
 class MistralConfig:
     """Configurações da Mistral AI"""
     
-    # Chave de API
-    API_KEY = os.getenv("MISTRAL_API_KEY", "")
+    # Chave de API (strip para evitar 401 por espaço/quebra ao colar no Render)
+    API_KEY = (os.getenv("MISTRAL_API_KEY", "") or "").strip()
     
     # Modelo a ser utilizado
     MODEL = os.getenv("MISTRAL_MODEL", "mistral-large-latest")
@@ -88,7 +88,7 @@ class MistralConfig:
     @classmethod
     def is_configured(cls) -> bool:
         """Verifica se a Mistral está configurada"""
-        return bool(cls.API_KEY and cls.API_KEY != "")
+        return bool(cls.API_KEY)
 
 class SchedulerConfig:
     """Configurações do agendador automático"""
