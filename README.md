@@ -41,11 +41,26 @@ http://localhost:8000/docs
 ## 🌐 Deploy no Render
 
 1. Conecte este repositório no Render (Blueprint com `render.yaml` ou crie um Web Service).
-2. Configure variáveis de ambiente no dashboard:
-   - `SUPABASE_URL` (obrigatório)
-   - `SUPABASE_KEY` (obrigatório)
-   - `MISTRAL_API_KEY` (opcional; necessário para "Classificar todas" / classificação por IA)
+2. Configure variáveis de ambiente no dashboard (veja **Checklist produção** abaixo).
 3. Deploy automático! ✅
+
+---
+
+## ✅ Checklist produção (Scheduler + Extração + Classificação)
+
+Para **tudo** funcionar em produção (extração, scheduler e classificação por IA):
+
+| Variável | Obrigatória para | Onde configurar |
+|----------|------------------|-----------------|
+| `SUPABASE_URL` | Extração, Scheduler, Classificação | Render → Environment |
+| `SUPABASE_KEY` | Extração, Scheduler, Classificação | Render → Environment (use **service_role**) |
+| `MISTRAL_API_KEY` | Classificação (manual e automática após extração) | Render → Environment |
+
+- **Extração:** funciona com Supabase configurado; pode ser manual (`POST /extrair/manual`) ou automática (scheduler).
+- **Scheduler:** carrega e persiste a config na tabela `scheduler_horario` (id=1). Ative com `POST /scheduler/configurar` (ativo: true, horario, modalidades, dias_atras).
+- **Classificação:** exige Supabase + `MISTRAL_API_KEY`. Manual: `POST /classificar/manual` ou `POST /classificar/todas`. Automática: após cada extração agendada, se houver licitações novas e Mistral configurado.
+
+**Verificar status:** `GET /` mostra `supabase.conectado`, `classificacao_ia.disponivel` e `scheduler.ativo`. Use `GET /scheduler/status` para próxima execução.
 
 ---
 
@@ -87,12 +102,15 @@ No plano **Free**, o serviço pode **dormir** após ~15 min sem requisições. E
 
 ## 📚 Endpoints
 
-- `GET /` - Status da API
+- `GET /` - Status da API (Supabase, classificação IA, scheduler)
+- `GET /health` - Health check (200 se a API está no ar)
 - `GET /docs` - Swagger UI
 - `GET /config` - Ver configurações
 - `POST /extrair/manual` - Extração manual
-- `POST /scheduler/configurar` - Configurar scheduler
-- `GET /scheduler/status` - Status do scheduler
+- `POST /scheduler/configurar` - Configurar scheduler (persiste no Supabase)
+- `GET /scheduler/status` - Status do scheduler e próxima execução
+- `POST /classificar/manual` - Classificar N licitações (IA)
+- `POST /classificar/todas` - Classificar todas as pendentes (IA)
 - `GET /estatisticas` - Estatísticas
 
 ---

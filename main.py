@@ -777,10 +777,13 @@ def tarefa_extracao_automatica():
         )
         logger.info(f"✅ Extração automática concluída: {resultado['total_salvos']} registros salvos de {resultado['total_encontrados']} encontrados")
         
-        # Após extração, roda classificação automática se houver novos registros
-        if resultado['total_salvos'] > 0 and MistralConfig.is_configured():
-            logger.info("🧠 Iniciando classificação automática de licitações...")
-            asyncio.run(tarefa_classificacao_automatica())
+        # Após extração, roda classificação automática se houver novos registros e Mistral configurado
+        if resultado.get('total_salvos', 0) > 0 and MistralConfig.is_configured() and SUPABASE_ENABLED:
+            try:
+                logger.info("🧠 Iniciando classificação automática de licitações...")
+                asyncio.run(tarefa_classificacao_automatica())
+            except Exception as e_class:
+                logger.error(f"❌ Erro na classificação automática (extração já concluída): {str(e_class)}")
             
     except Exception as e:
         logger.error(f"❌ Erro na extração automática: {str(e)}")
@@ -821,6 +824,14 @@ async def tarefa_classificacao_automatica():
 # ENDPOINTS
 # ============================================================================
 
+@app.get("/health")
+def health():
+    """
+    Health check para produção (ex.: Render).
+    Retorna 200 se a API está no ar. Use healthCheckPath: /health no Render se quiser.
+    """
+    return {"status": "ok", "servico": "pncp-licitacoes-api"}
+
 @app.get("/")
 def root():
     """Endpoint raiz com informações da API"""
@@ -835,16 +846,27 @@ def root():
             "conectado": SUPABASE_ENABLED,
             "tabela": SupabaseConfig.TABLE_NAME if SUPABASE_ENABLED else "N/A"
         },
+        "classificacao_ia": {
+            "disponivel": SUPABASE_ENABLED and MistralConfig.is_configured(),
+            "motivo_indisponivel": (
+                None if (SUPABASE_ENABLED and MistralConfig.is_configured()) else
+                "Supabase: configure SUPABASE_URL e SUPABASE_KEY." if not SUPABASE_ENABLED else
+                "Mistral: configure MISTRAL_API_KEY no ambiente (ex.: Render → Environment)."
+            )
+        },
         "scheduler": {
             "ativo": scheduler_config["ativo"],
             "horario": scheduler_config["horario"],
-            "modalidades": scheduler_config["modalidades"]
+            "dias_atras": scheduler_config.get("dias_atras", SchedulerConfig.DIAS_ATRAS),
+            "modalidades": scheduler_config["modalidades"],
+            "limite_paginas": scheduler_config.get("limite_paginas")
         },
         "configuracoes": {
             "tamanho_pagina_padrao": PNCPConfig.DEFAULT_PAGE_SIZE,
             "timeout": PNCPConfig.REQUEST_TIMEOUT
         },
         "endpoints": {
+            "health": "GET /health",
             "docs": "/docs",
             "configuracoes": "GET /config",
             "atualizar_config": "POST /config/atualizar",
@@ -860,10 +882,15 @@ def root():
 @app.get("/scheduler/status")
 def status_scheduler():
     """Retorna status do scheduler"""
+    jobs = scheduler.get_jobs()
+    proxima = None
+    if jobs:
+        next_run = getattr(jobs[0], "next_run_time", None)
+        proxima = str(next_run) if next_run is not None else None
     return {
         "scheduler_rodando": scheduler.running,
         "configuracao": scheduler_config,
-        "proxima_execucao": str(scheduler.get_jobs()[0].next_run_time) if scheduler.get_jobs() else None
+        "proxima_execucao": proxima
     }
 
 @app.post("/scheduler/configurar")
@@ -1067,17 +1094,23 @@ def extrair_manual(request: ExtrairManualRequest, background_tasks: BackgroundTa
         logger.error(f"Erro na extração manual: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+def _verificar_config_classificacao():
+    """Retorna (ok, detail) para uso nos endpoints de classificação."""
+    if not SUPABASE_ENABLED:
+        return False, "Supabase não conectado. Configure SUPABASE_URL e SUPABASE_KEY no ambiente (ex.: Render → Environment)."
+    if not MistralConfig.is_configured():
+        return False, "Mistral AI não configurada. Configure MISTRAL_API_KEY no ambiente (ex.: Render → Environment)."
+    return True, None
+
 @app.post("/classificar/manual", tags=["Classificação"])
 async def classificar_manual(request: ClassificarRequest, background_tasks: BackgroundTasks):
     """
     Classifica licitações manualmente usando IA (Mistral). Processa em background.
     Requer MISTRAL_API_KEY configurada e Supabase com setores/subsetores.
     """
-    if not SUPABASE_ENABLED:
-        raise HTTPException(status_code=503, detail="Supabase não conectado")
-        
-    if not MistralConfig.is_configured():
-        raise HTTPException(status_code=503, detail="Mistral AI não configurada (MISTRAL_API_KEY ausente)")
+    ok, detail = _verificar_config_classificacao()
+    if not ok:
+        raise HTTPException(status_code=503, detail=detail)
     
     async def processar_background(limite: int):
         classificador = ClassificadorIA(supabase)
@@ -1096,11 +1129,9 @@ async def classificar_todas(background_tasks: BackgroundTasks):
     Classifica TODAS as licitações pendentes (subsetor_principal_id nulo) usando IA.
     Processa em background, sem limite. Requer MISTRAL_API_KEY e Supabase.
     """
-    if not SUPABASE_ENABLED:
-        raise HTTPException(status_code=503, detail="Supabase não conectado")
-        
-    if not MistralConfig.is_configured():
-        raise HTTPException(status_code=503, detail="Mistral AI não configurada (MISTRAL_API_KEY ausente)")
+    ok, detail = _verificar_config_classificacao()
+    if not ok:
+        raise HTTPException(status_code=503, detail=detail)
     
     async def processar_todas():
         classificador = ClassificadorIA(supabase)
@@ -1291,10 +1322,12 @@ def startup_event():
             # Se estava ativo, reativa o scheduler
             if config_banco.get('ativo'):
                 try:
-                    hora, minuto = config_banco['horario'].split(':')
+                    partes = config_banco.get('horario', '06:00').strip().split(':')
+                    hora = int(partes[0]) if partes else 6
+                    minuto = int(partes[1]) if len(partes) > 1 else 0
                     scheduler.add_job(
                         tarefa_extracao_automatica,
-                        trigger=CronTrigger(hour=int(hora), minute=int(minuto)),
+                        trigger=CronTrigger(hour=hora, minute=minuto),
                         id='extracao_diaria',
                         name='Extração Diária PNCP',
                         replace_existing=True
