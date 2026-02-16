@@ -127,7 +127,10 @@ class ClassificarRequest(BaseModel):
 app = FastAPI(
     title=ServerConfig.APP_NAME,
     description=ServerConfig.DESCRIPTION,
-    version=ServerConfig.VERSION
+    version=ServerConfig.VERSION,
+    openapi_tags=[
+        {"name": "Classificação (IA)", "description": "Endpoints para classificar licitações por setor/subsetor usando Mistral AI"}
+    ]
 )
 
 scheduler = BackgroundScheduler()
@@ -138,9 +141,6 @@ scheduler_config = {
     "dias_atras": SchedulerConfig.DIAS_ATRAS,
     "limite_paginas": None  # None = SEM LIMITE (busca tudo!)
 }
-
-# Tamanho do lote na classificação (Supabase/PostgREST costuma limitar ~1000 linhas por request)
-CLASSIFICACAO_BATCH_SIZE = 1000
 
 # ============================================================================
 # FUNÇÕES DE PERSISTÊNCIA DE CONFIGURAÇÃO
@@ -811,20 +811,11 @@ async def tarefa_classificacao_automatica():
             logger.info("🎉 Nenhuma licitação pendente de classificação")
             return
             
-        logger.info(f"🧠 Iniciando classificação automática de {total_pendentes} licitações pendentes (em lotes de {CLASSIFICACAO_BATCH_SIZE})...")
+        logger.info(f"🧠 Iniciando classificação automática de {total_pendentes} licitações pendentes...")
         
-        # Processa em lotes até não haver mais pendentes (cobre a base toda)
-        total_stats = {"processados": 0, "sucessos": 0, "falhas": 0}
-        while True:
-            stats = await classificador.classificar_pendentes(limite=CLASSIFICACAO_BATCH_SIZE)
-            processados = stats.get("processados", 0)
-            if processados == 0:
-                break
-            total_stats["processados"] += processados
-            total_stats["sucessos"] += stats.get("sucessos", 0)
-            total_stats["falhas"] += stats.get("falhas", 0)
-            logger.info(f"   Lote: {stats} | Acumulado: {total_stats}")
-        logger.info(f"✅ Classificação automática concluída: {total_stats}")
+        # Processa TODAS as licitações pendentes (sem limite)
+        stats = await classificador.classificar_pendentes(limite=total_pendentes)
+        logger.info(f"✅ Classificação concluída: {stats}")
         
     except Exception as e:
         logger.error(f"❌ Erro na classificação automática: {str(e)}")
@@ -863,6 +854,8 @@ def root():
             "configurar_scheduler": "POST /scheduler/configurar",
             "status_scheduler": "GET /scheduler/status",
             "extrair_manual": "POST /extrair/manual",
+            "classificar_manual": "POST /classificar/manual",
+            "classificar_todas": "POST /classificar/todas",
             "estatisticas": "GET /estatisticas"
         }
     }
@@ -1077,10 +1070,11 @@ def extrair_manual(request: ExtrairManualRequest, background_tasks: BackgroundTa
         logger.error(f"Erro na extração manual: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/classificar/manual")
+@app.post("/classificar/manual", tags=["Classificação (IA)"])
 async def classificar_manual(request: ClassificarRequest, background_tasks: BackgroundTasks):
     """
-    Classifica licitações manualmente usando IA
+    Classifica licitações pendentes usando IA (Mistral). Envia limite de quantas processar.
+    Requer MISTRAL_API_KEY e Supabase com tabelas setores/subsetores e licitacoes_classificacao.
     """
     if not SUPABASE_ENABLED:
         raise HTTPException(status_code=503, detail="Supabase não conectado")
@@ -1099,10 +1093,11 @@ async def classificar_manual(request: ClassificarRequest, background_tasks: Back
         "mensagem": f"Classificação iniciada em background (limite={request.limite})"
     }
 
-@app.post("/classificar/todas")
+@app.post("/classificar/todas", tags=["Classificação (IA)"])
 async def classificar_todas(background_tasks: BackgroundTasks):
     """
-    Classifica TODAS as licitações pendentes usando IA (sem limite)
+    Classifica TODAS as licitações pendentes (subsetor_principal_id nulo) usando IA. Sem limite.
+    Requer MISTRAL_API_KEY. Execução em background.
     """
     if not SUPABASE_ENABLED:
         raise HTTPException(status_code=503, detail="Supabase não conectado")
@@ -1125,20 +1120,11 @@ async def classificar_todas(background_tasks: BackgroundTasks):
             logger.info("🎉 Nenhuma licitação pendente de classificação")
             return
             
-        logger.info(f"🧠 Iniciando classificação de {total_pendentes} licitações pendentes (em lotes de {CLASSIFICACAO_BATCH_SIZE})...")
+        logger.info(f"🧠 Iniciando classificação de {total_pendentes} licitações pendentes...")
         
-        # Processa em lotes até não haver mais pendentes (cobre a base toda)
-        total_stats = {"processados": 0, "sucessos": 0, "falhas": 0}
-        while True:
-            stats = await classificador.classificar_pendentes(limite=CLASSIFICACAO_BATCH_SIZE)
-            processados = stats.get("processados", 0)
-            if processados == 0:
-                break
-            total_stats["processados"] += processados
-            total_stats["sucessos"] += stats.get("sucessos", 0)
-            total_stats["falhas"] += stats.get("falhas", 0)
-            logger.info(f"   Lote: {stats} | Acumulado: {total_stats}")
-        logger.info(f"✅ Classificação concluída: {total_stats}")
+        # Processa TODAS as licitações pendentes
+        stats = await classificador.classificar_pendentes(limite=total_pendentes)
+        logger.info(f"✅ Classificação concluída: {stats}")
         
     background_tasks.add_task(processar_todas)
     
@@ -1296,6 +1282,11 @@ def startup_event():
     
     if SUPABASE_ENABLED:
         logger.info("✅ API pronta para uso com Supabase!")
+        logger.info("📌 Endpoints de classificação (IA): POST /classificar/manual, POST /classificar/todas")
+        if MistralConfig.is_configured():
+            logger.info("🧠 Mistral AI configurada — classificação por IA disponível")
+        else:
+            logger.warning("⚠️ MISTRAL_API_KEY não definida — classificação por IA indisponível")
         
         # Carrega configuração do scheduler do banco
         logger.info("📥 Carregando configuração do scheduler do banco...")
