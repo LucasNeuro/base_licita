@@ -5,11 +5,17 @@ from datetime import datetime
 from typing import List, Dict, Optional, Any
 from mistralai import Mistral
 from supabase import Client
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+from rich.table import Table
+from rich import box
 
 from config import MistralConfig, SupabaseConfig
 
 # Configuração de logs
 logger = logging.getLogger(__name__)
+console = Console()
 
 class ClassificadorIA:
     """Classificador de licitações usando Mistral AI"""
@@ -30,67 +36,105 @@ class ClassificadorIA:
     
     async def classificar_pendentes(self, limite: int = 50) -> Dict[str, int]:
         """
-        Busca licitações sem classificação e processa com IA
-        
+        Busca licitações sem classificação e processa com IA.
+        Exibe progresso com Rich no terminal (incl. Render).
         Returns:
             Dict com estatísticas (processados, sucessos, falhas)
         """
         if not self.client:
+            console.print(Panel("[red]Mistral não configurado (MISTRAL_API_KEY).[/red]", title="Classificação IA", border_style="red"))
             return {"erro": "Mistral não configurado"}
-            
+
         stats = {"processados": 0, "sucessos": 0, "falhas": 0}
-        
-        # 1. Carregar setores e subsetores para contexto (cache simples)
+
+        # 1. Carregar taxonomia
         setores_map = self._carregar_taxonomia()
         if not setores_map:
+            console.print(Panel("[red]Não foi possível carregar taxonomia (setores/subsetores).[/red]", title="Classificação IA", border_style="red"))
             logger.error("❌ Não foi possível carregar taxonomia de setores")
             return stats
-            
+
         # 2. Buscar licitações pendentes
         try:
-            # Busca onde subsetor_principal_id é null
             response = self.supabase.table(SupabaseConfig.TABLE_NAME)\
                 .select("id, objeto_compra, orgao_razao_social, modalidade_nome, itens")\
                 .is_("subsetor_principal_id", "null")\
                 .limit(limite)\
                 .execute()
-                
             licitacoes = response.data
-            
+
             if not licitacoes:
+                console.print(Panel("[green]Nenhuma licitação pendente de classificação.[/green]", title="Classificação IA", border_style="green"))
                 logger.info("🎉 Nenhuma licitação pendente de classificação")
                 return stats
-                
-            logger.info(f"🧠 Classificando {len(licitacoes)} licitações...")
-            
-            # 3. Processar cada licitação
-            for licitacao in licitacoes:
-                stats["processados"] += 1
-                
-                try:
-                    # Monta prompt
-                    prompt = self._montar_prompt(licitacao, setores_map)
-                    
-                    # Chama Mistral
-                    resposta_ia = await self._chamar_mistral(prompt)
-                    
-                    if resposta_ia:
-                        # Salva resultado
-                        sucesso = self._salvar_classificacao(licitacao['id'], resposta_ia)
-                        if sucesso:
-                            stats["sucessos"] += 1
+
+            total = len(licitacoes)
+            console.print()
+            console.print(Panel.fit(
+                f"[bold cyan]CLASSIFICAÇÃO DE LICITAÇÕES (IA)[/bold cyan]\n\n"
+                f"[yellow]Modelo:[/yellow] {self.model}\n"
+                f"[yellow]Total a processar:[/yellow] {total}\n"
+                f"[yellow]Taxonomia:[/yellow] setores/subsetores carregados",
+                border_style="cyan",
+                title="🧠 Iniciando"
+            ))
+            console.print()
+
+            # 3. Processar com barra de progresso Rich
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TextColumn("•"),
+                TextColumn("[cyan]{task.completed}/{task.total}[/cyan]"),
+                TimeElapsedColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task("[cyan]Classificando...", total=total)
+                for licitacao in licitacoes:
+                    stats["processados"] += 1
+                    try:
+                        prompt = self._montar_prompt(licitacao, setores_map)
+                        resposta_ia = await self._chamar_mistral(prompt)
+                        if resposta_ia:
+                            sucesso = self._salvar_classificacao(licitacao['id'], resposta_ia)
+                            if sucesso:
+                                stats["sucessos"] += 1
+                            else:
+                                stats["falhas"] += 1
                         else:
                             stats["falhas"] += 1
-                    else:
+                    except Exception as e:
+                        logger.error(f"Erro ao classificar licitação {licitacao.get('id')}: {e}")
                         stats["falhas"] += 1
-                        
-                except Exception as e:
-                    logger.error(f"Erro ao classificar licitação {licitacao.get('id')}: {e}")
-                    stats["falhas"] += 1
-                    
+                    progress.update(task, advance=1)
+
+            # 4. Resumo em tabela Rich
+            tabela = Table(title="Resumo da classificação", box=box.ROUNDED, show_header=True, header_style="bold cyan")
+            tabela.add_column("Métrica", style="yellow", width=20)
+            tabela.add_column("Valor", justify="right", style="green")
+            tabela.add_row("Processados", str(stats["processados"]))
+            tabela.add_row("Sucessos", f"[bold green]{stats['sucessos']}[/bold green]")
+            tabela.add_row("Falhas", f"[red]{stats['falhas']}[/red]" if stats["falhas"] else "0")
+            taxa = f"{(stats['sucessos']/total*100):.1f}%" if total else "0%"
+            tabela.add_row("Taxa sucesso", taxa)
+            console.print()
+            console.print(tabela)
+            console.print()
+            console.print(Panel.fit(
+                f"[bold green]Classificação concluída.[/bold green]\n"
+                f"Processados: {stats['processados']} | Sucessos: {stats['sucessos']} | Falhas: {stats['falhas']}",
+                border_style="green",
+                title="✅ Fim"
+            ))
+            console.print()
+            logger.info(f"✅ Classificação concluída: {stats}")
+
         except Exception as e:
             logger.error(f"Erro no fluxo de classificação: {e}")
-            
+            console.print(Panel(f"[red]Erro: {e}[/red]", title="Classificação IA", border_style="red"))
+
         return stats
 
     def _carregar_taxonomia(self) -> str:
