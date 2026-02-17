@@ -7,7 +7,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # Carrega variáveis de ambiente do arquivo .env
-load_dotenv()
+# Importante: usa o diretório deste arquivo como base,
+# assim o .env em base_licita/.env é carregado mesmo se o
+# processo for iniciado a partir da pasta acima (vamos/).
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
 # ============================================================================
 # CONFIGURAÇÕES DO SUPABASE

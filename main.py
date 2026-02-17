@@ -757,68 +757,131 @@ def atualizar_ultima_execucao():
         logger.error(f"❌ Erro ao atualizar última execução: {str(e)}")
 
 def tarefa_extracao_automatica():
-    """Tarefa executada pelo scheduler"""
-    logger.info("⏰ Executando extração automática agendada...")
-    
-    # Atualiza última execução no banco
-    atualizar_ultima_execucao()
-    
+    """Tarefa executada pelo scheduler. Extração PNCP roda SEMPRE primeiro; classificação IA é opcional depois."""
+    agora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     modalidades = scheduler_config.get("modalidades", SchedulerConfig.MODALIDADES_PADRAO)
     dias_atras = scheduler_config.get("dias_atras", SchedulerConfig.DIAS_ATRAS)
     limite_paginas = scheduler_config.get("limite_paginas", SchedulerConfig.LIMITE_PAGINAS_AUTO)
-    
-    logger.info(f"📋 Configuração: {len(modalidades)} modalidades, {dias_atras} dia(s) atrás, {limite_paginas} páginas max")
-    
+
+    # ---- Rich: início da rotina agendada (visível no Render) ----
+    console.print()
+    console.print(Panel.fit(
+        f"[bold cyan]⏰ EXTRAÇÃO AUTOMÁTICA AGENDADA[/bold cyan]\n\n"
+        f"[yellow]Início:[/yellow] {agora}\n"
+        f"[yellow]Modalidades:[/yellow] {len(modalidades)} → {', '.join(map(str, modalidades))}\n"
+        f"[yellow]Dias atrás:[/yellow] {dias_atras} | [yellow]Limite páginas:[/yellow] {limite_paginas or 'Sem limite'}",
+        border_style="cyan",
+        title="[Scheduler]"
+    ))
+    console.print()
+    logger.info("⏰ Executando extração automática agendada...")
+
+    # Atualiza última execução no banco
+    atualizar_ultima_execucao()
+
     try:
+        # 1) EXTRAÇÃO sempre roda primeiro (não depende da Mistral)
         resultado = processar_extracao(
             dias_atras=dias_atras,
             modalidades=modalidades,
             limite_paginas=limite_paginas
         )
-        logger.info(f"✅ Extração automática concluída: {resultado['total_salvos']} registros salvos de {resultado['total_encontrados']} encontrados")
-        
-        # Após extração, roda classificação automática se houver novos registros e Mistral configurado
-        if resultado.get('total_salvos', 0) > 0 and MistralConfig.is_configured() and SUPABASE_ENABLED:
+        total_salvos = resultado.get('total_salvos', 0)
+        total_encontrados = resultado.get('total_encontrados', 0)
+
+        # ---- Rich: resumo da extração ----
+        console.print()
+        console.print(Panel.fit(
+            f"[bold green]✅ EXTRAÇÃO AUTOMÁTICA CONCLUÍDA[/bold green]\n\n"
+            f"[cyan]Encontrados:[/cyan] {total_encontrados}\n"
+            f"[cyan]Salvos/atualizados:[/cyan] [bold]{total_salvos}[/bold]\n"
+            f"[cyan]Erros:[/cyan] {resultado.get('total_erros', 0)}",
+            border_style="green",
+            title="[Resultado Extração]"
+        ))
+        console.print()
+        logger.info(f"✅ Extração automática concluída: {total_salvos} registros salvos de {total_encontrados} encontrados")
+
+        # 2) Classificação por IA é OPCIONAL: só roda depois da extração
+        if total_salvos > 0 and MistralConfig.is_configured() and SUPABASE_ENABLED:
             try:
-                logger.info("🧠 Iniciando classificação automática de licitações...")
+                console.print(Panel.fit(
+                    "[bold magenta]🧠 Iniciando classificação automática (Mistral)[/bold magenta]\n"
+                    "Lote: até 1000 licitações pendentes.",
+                    border_style="magenta",
+                    title="[Classificação IA]"
+                ))
+                console.print()
+                logger.info("🧠 Iniciando classificação automática de licitações (Mistral)...")
                 asyncio.run(tarefa_classificacao_automatica())
             except Exception as e_class:
-                logger.error(f"❌ Erro na classificação automática (extração já concluída): {str(e_class)}")
-            
+                logger.error(f"❌ Erro na classificação automática (extração já concluída com sucesso): {str(e_class)}")
+                console.print(Panel.fit(f"[red]Erro na classificação: {e_class}[/red]\n[dim]Extração já concluída.[/dim]", border_style="red", title="[Aviso]"))
+        elif total_salvos > 0 and not MistralConfig.is_configured():
+            console.print(Panel.fit("[yellow]ℹ️ Classificação não executada: MISTRAL_API_KEY não configurada.[/yellow]\nExtração já concluída.", border_style="yellow", title="[Info]"))
+            logger.info("ℹ️ Classificação automática não executada: MISTRAL_API_KEY não configurada (extração já concluída)")
+        elif total_salvos == 0:
+            console.print(Panel.fit("[dim]Nenhum registro novo salvo; classificação automática não executada.[/dim]", border_style="dim", title="[Info]"))
+            logger.info("ℹ️ Nenhum registro novo salvo; classificação automática não executada.")
+
     except Exception as e:
         logger.error(f"❌ Erro na extração automática: {str(e)}")
+        console.print(Panel.fit(f"[bold red]❌ Erro na extração automática[/bold red]\n\n{e}", border_style="red", title="[Erro]"))
+        console.print()
 
 async def tarefa_classificacao_automatica():
-    """Tarefa de classificação automática - PROCESSA TODAS AS LICITAÇÕES PENDENTES"""
+    """Tarefa de classificação automática - processa PENDENTES em lotes (ex.: 1000 por dia)"""
     try:
         if not SUPABASE_ENABLED:
             logger.warning("⚠️ Supabase não conectado - pulando classificação")
+            console.print(Panel.fit("[yellow]Supabase não conectado - classificação ignorada.[/yellow]", border_style="yellow", title="[Classificação]"))
             return
 
         classificador = ClassificadorIA(supabase)
-        
-        # Primeiro, conta quantas licitações pendentes existem
+        LOTE_MAXIMO = 1000
+
         from classificador import SupabaseConfig
-        
-        response = supabase.table(SupabaseConfig.TABLE_NAME)\
-            .select("id", count='exact')\
-            .is_("subsetor_principal_id", "null")\
+        response = supabase.table(SupabaseConfig.TABLE_NAME) \
+            .select("id", count='exact') \
+            .is_("subsetor_principal_id", "null") \
             .execute()
-        
         total_pendentes = response.count if hasattr(response, 'count') else 0
-        
+
         if total_pendentes == 0:
             logger.info("🎉 Nenhuma licitação pendente de classificação")
+            console.print(Panel.fit("[green]Nenhuma licitação pendente de classificação.[/green]", border_style="green", title="[Classificação]"))
+            console.print()
             return
-            
-        logger.info(f"🧠 Iniciando classificação automática de {total_pendentes} licitações pendentes...")
-        
-        # Processa TODAS as licitações pendentes (sem limite)
-        stats = await classificador.classificar_pendentes(limite=total_pendentes)
-        logger.info(f"✅ Classificação concluída: {stats}")
-        
+
+        lote = min(LOTE_MAXIMO, total_pendentes)
+        # ---- Rich: início classificação automática (visível no Render) ----
+        console.print(Panel.fit(
+            f"[bold magenta]CLASSIFICAÇÃO AUTOMÁTICA (Mistral)[/bold magenta]\n\n"
+            f"[cyan]Pendentes totais:[/cyan] {total_pendentes}\n"
+            f"[cyan]Lote desta execução:[/cyan] {lote}",
+            border_style="magenta",
+            title="[Início]"
+        ))
+        console.print()
+        logger.info(f"🧠 Iniciando classificação automática em lote: {lote} de {total_pendentes} licitações pendentes...")
+
+        stats = await classificador.classificar_pendentes(limite=lote)
+        logger.info(f"✅ Classificação automática (lote) concluída: {stats}")
+        # ---- Rich: resumo classificação automática ----
+        console.print()
+        console.print(Panel.fit(
+            f"[bold green]✅ CLASSIFICAÇÃO AUTOMÁTICA CONCLUÍDA[/bold green]\n\n"
+            f"[cyan]Processados:[/cyan] {stats.get('processados', 0)}\n"
+            f"[cyan]Sucessos:[/cyan] {stats.get('sucessos', 0)}\n"
+            f"[cyan]Falhas:[/cyan] {stats.get('falhas', 0)}",
+            border_style="green",
+            title="[Resultado Classificação]"
+        ))
+        console.print()
     except Exception as e:
         logger.error(f"❌ Erro na classificação automática: {str(e)}")
+        console.print(Panel.fit(f"[bold red]Erro na classificação automática[/bold red]\n\n{e}", border_style="red", title="[Erro]"))
+        console.print()
 
 # ============================================================================
 # ENDPOINTS
