@@ -227,7 +227,13 @@ class ClassificadorIA:
             return json.loads(conteudo)
             
         except Exception as e:
+            msg = str(e)
             logger.error(f"Erro na chamada Mistral: {e}")
+            if "401" in msg or "Unauthorized" in msg:
+                logger.error(
+                    "💡 MISTRAL_API_KEY inválida ou expirada. No Render: Environment → MISTRAL_API_KEY. "
+                    "Gere uma nova chave em https://console.mistral.ai/ e cole sem espaços."
+                )
             return None
 
     def _salvar_classificacao(self, licitacao_id: str, resultado: Dict) -> bool:
