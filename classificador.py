@@ -27,12 +27,14 @@ class ClassificadorIA:
         
         if MistralConfig.is_configured():
             try:
-                self.client = Mistral(api_key=MistralConfig.API_KEY)
-                logger.info("✅ Cliente Mistral AI inicializado")
+                api_key = MistralConfig.API_KEY
+                # SDK Mistral envia no header: Authorization: Bearer <api_key>
+                self.client = Mistral(api_key=api_key)
+                logger.info("✅ Cliente Mistral AI inicializado (chave no header Authorization: %d caracteres)", len(api_key))
             except Exception as e:
                 logger.error(f"❌ Erro ao inicializar Mistral: {e}")
         else:
-            logger.warning("⚠️ Mistral AI não configurada (MISTRAL_API_KEY ausente)")
+            logger.warning("⚠️ Mistral AI não configurada (MISTRAL_API_KEY ausente ou vazia no ambiente)")
     
     async def classificar_pendentes(self, limite: int = 50) -> Dict[str, int]:
         """

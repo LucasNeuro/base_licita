@@ -215,6 +215,11 @@ def validar_configuracoes() -> dict:
             "modalidades": SchedulerConfig.MODALIDADES_PADRAO,
             "dias_atras": SchedulerConfig.DIAS_ATRAS
         },
+        "mistral": {
+            "configurado": MistralConfig.is_configured(),
+            "key_length": len(MistralConfig.API_KEY),
+            "modelo": MistralConfig.MODEL
+        },
         "servidor": {
             "host": ServerConfig.HOST,
             "port": ServerConfig.PORT,
@@ -253,6 +258,14 @@ def exibir_configuracoes():
     print(f"   Horário: {status['scheduler']['horario']}")
     print(f"   Modalidades: {status['scheduler']['modalidades']}")
     print(f"   Dias atrás: {status['scheduler']['dias_atras']}")
+    
+    print(f"\n🧠 MISTRAL (classificação IA):")
+    if status['mistral']['configurado']:
+        print(f"   ✅ Configurada (chave com {status['mistral']['key_length']} caracteres)")
+        print(f"   Modelo: {status['mistral']['modelo']}")
+    else:
+        print(f"   ❌ NÃO CONFIGURADA (MISTRAL_API_KEY ausente ou vazia)")
+        print(f"   No Render: Environment → adicione MISTRAL_API_KEY")
     
     print(f"\n🖥️  SERVIDOR:")
     print(f"   Host: {status['servidor']['host']}")
