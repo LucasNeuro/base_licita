@@ -915,7 +915,8 @@ def root():
                 None if (SUPABASE_ENABLED and MistralConfig.is_configured()) else
                 "Supabase: configure SUPABASE_URL e SUPABASE_KEY." if not SUPABASE_ENABLED else
                 "Mistral: configure MISTRAL_API_KEY no ambiente (ex.: Render → Environment)."
-            )
+            ),
+            "mistral_key_length": len(MistralConfig.API_KEY)
         },
         "scheduler": {
             "ativo": scheduler_config["ativo"],
