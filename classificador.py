@@ -29,6 +29,8 @@ class ClassificadorIA:
         self.supabase = supabase_client
         self.client = None
         self.model = MistralConfig.MODEL
+        # Mapa subsetor_id -> setor_id (preenchido ao carregar taxonomia; evita query extra ao salvar)
+        self._subsetor_to_setor: Dict[str, str] = {}
         
         if MistralConfig.is_configured():
             try:
@@ -156,18 +158,22 @@ class ClassificadorIA:
         return stats
 
     def _carregar_taxonomia(self) -> str:
-        """Carrega lista de setores/subsetores formatada para o prompt"""
+        """Carrega lista de setores/subsetores formatada para o prompt e mapa subsetor_id -> setor_id."""
         try:
-            # Busca subsetores ativos com seus setores
+            # Busca subsetores ativos com setor_id e nome do setor (evita segunda query ao salvar)
             response = self.supabase.table("subsetores")\
-                .select("id, nome, descricao, setores(nome)")\
+                .select("id, nome, descricao, setor_id, setores(nome)")\
                 .eq("ativo", True)\
                 .execute()
                 
             subsetores = response.data
             
             if not subsetores:
+                self._subsetor_to_setor = {}
                 return None
+
+            # Mapa para obter setor_id ao salvar, sem nova requisição ao Supabase
+            self._subsetor_to_setor = {str(sub["id"]): str(sub["setor_id"]) for sub in subsetores if sub.get("setor_id")}
                 
             # Formata para texto: "ID: Nome (Setor) - Descrição"
             lista_texto = []
@@ -182,6 +188,7 @@ class ClassificadorIA:
             
         except Exception as e:
             logger.error(f"Erro ao carregar taxonomia: {e}")
+            self._subsetor_to_setor = {}
             return None
 
     def _montar_prompt(self, licitacao: Dict, taxonomia: str) -> str:
@@ -266,14 +273,17 @@ class ClassificadorIA:
             
             if not subsetor_id:
                 return False
-                
-            # 1. Buscar setor_id do subsetor
-            resp_sub = self.supabase.table("subsetores").select("setor_id").eq("id", subsetor_id).single().execute()
-            if not resp_sub.data:
-                logger.error(f"Subsetor {subsetor_id} não encontrado")
+
+            # 1. Obter setor_id do mapa carregado na taxonomia (evita query extra e 406/PGRST116)
+            subsetor_id_str = str(subsetor_id).strip()
+            setor_id = self._subsetor_to_setor.get(subsetor_id_str)
+            if not setor_id:
+                logger.error(
+                    "Subsetor retornado pela IA não está na taxonomia carregada: %s. "
+                    "Ignore se a IA devolveu ID inválido; caso contrário, confira a tabela subsetores no Supabase.",
+                    subsetor_id_str,
+                )
                 return False
-                
-            setor_id = resp_sub.data["setor_id"]
             
             # 2. Inserir na tabela de vínculo (upsert), incluindo justificativa/descrição
             dados_vinculo = {
