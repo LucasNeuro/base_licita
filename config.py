@@ -80,8 +80,9 @@ class PNCPConfig:
 class MistralConfig:
     """Configurações da Mistral AI"""
     
-    # Chave de API (strip para evitar 401 por espaço/quebra ao colar no Render)
-    API_KEY = (os.getenv("MISTRAL_API_KEY", "") or "").strip()
+    # Chave de API (strip + remove aspas acidentais ao colar no Render)
+    _raw = (os.getenv("MISTRAL_API_KEY", "") or "").strip().strip('"').strip("'")
+    API_KEY = _raw
     
     # Modelo a ser utilizado (strip para evitar erro se houver espaço no .env)
     MODEL = (os.getenv("MISTRAL_MODEL", "mistral-large-latest") or "mistral-large-latest").strip()
