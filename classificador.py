@@ -17,6 +17,11 @@ from config import MistralConfig, SupabaseConfig
 logger = logging.getLogger(__name__)
 console = Console()
 
+
+class MistralUnauthorizedError(Exception):
+    """Erro 401 da Mistral: chave inválida ou expirada. Interrompe o lote de classificação."""
+    pass
+
 class ClassificadorIA:
     """Classificador de licitações usando Mistral AI"""
     
@@ -107,6 +112,17 @@ class ClassificadorIA:
                                 stats["falhas"] += 1
                         else:
                             stats["falhas"] += 1
+                    except MistralUnauthorizedError:
+                        logger.error("Classificação interrompida: chave Mistral inválida (401). Corrija MISTRAL_API_KEY no Render e faça redeploy.")
+                        console.print(Panel.fit(
+                            "[red]Classificação interrompida: MISTRAL_API_KEY inválida (401).[/red]\n"
+                            "Corrija a chave no Render (Environment) e faça redeploy.",
+                            border_style="red",
+                            title="[Mistral 401]"
+                        ))
+                        stats["falhas"] += 1
+                        progress.update(task, advance=1)
+                        break
                     except Exception as e:
                         logger.error(f"Erro ao classificar licitação {licitacao.get('id')}: {e}")
                         stats["falhas"] += 1
@@ -230,12 +246,13 @@ class ClassificadorIA:
             
         except Exception as e:
             msg = str(e)
-            logger.error(f"Erro na chamada Mistral: {e}")
             if "401" in msg or "Unauthorized" in msg:
                 logger.error(
                     "💡 MISTRAL_API_KEY inválida ou expirada. No Render: Environment → MISTRAL_API_KEY. "
                     "Gere uma nova chave em https://console.mistral.ai/ e cole sem espaços."
                 )
+                raise MistralUnauthorizedError("Mistral retornou 401 Unauthorized") from e
+            logger.error(f"Erro na chamada Mistral: {e}")
             return None
 
     def _salvar_classificacao(self, licitacao_id: str, resultado: Dict) -> bool:

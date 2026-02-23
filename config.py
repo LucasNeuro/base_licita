@@ -83,8 +83,8 @@ class MistralConfig:
     # Chave de API (strip para evitar 401 por espaço/quebra ao colar no Render)
     API_KEY = (os.getenv("MISTRAL_API_KEY", "") or "").strip()
     
-    # Modelo a ser utilizado
-    MODEL = os.getenv("MISTRAL_MODEL", "mistral-large-latest")
+    # Modelo a ser utilizado (strip para evitar erro se houver espaço no .env)
+    MODEL = (os.getenv("MISTRAL_MODEL", "mistral-large-latest") or "mistral-large-latest").strip()
     
     # Temperatura (criatividade vs determinismo)
     TEMPERATURE = 0.2
@@ -112,6 +112,14 @@ class SchedulerConfig:
     
     # Limite de páginas na extração manual (padrão)
     LIMITE_PAGINAS_MANUAL = 10
+
+
+class ClassificacaoSchedulerConfig:
+    """Scheduler só de classificação (independente da extração). Roda em horário fixo, lote de 1000."""
+    # Horário diário (HH:MM) - ex.: 17:00
+    HORARIO = os.getenv("HORARIO_CLASSIFICACAO", "17:00")
+    # Tamanho do lote por execução
+    LOTE_MAXIMO = int(os.getenv("CLASSIFICACAO_LOTE", "1000") or "1000")
 
 # ============================================================================
 # CONFIGURAÇÕES DO SERVIDOR
@@ -215,6 +223,10 @@ def validar_configuracoes() -> dict:
             "modalidades": SchedulerConfig.MODALIDADES_PADRAO,
             "dias_atras": SchedulerConfig.DIAS_ATRAS
         },
+        "scheduler_classificacao": {
+            "horario": ClassificacaoSchedulerConfig.HORARIO,
+            "lote_maximo": ClassificacaoSchedulerConfig.LOTE_MAXIMO
+        },
         "mistral": {
             "configurado": MistralConfig.is_configured(),
             "key_length": len(MistralConfig.API_KEY),
@@ -254,10 +266,12 @@ def exibir_configuracoes():
     print(f"   Integração: {status['pncp']['integracao_url']}")
     print(f"   Timeout: {status['pncp']['timeout']}s")
     
-    print(f"\n⏰ SCHEDULER:")
+    print(f"\n⏰ SCHEDULER EXTRAÇÃO:")
     print(f"   Horário: {status['scheduler']['horario']}")
     print(f"   Modalidades: {status['scheduler']['modalidades']}")
     print(f"   Dias atrás: {status['scheduler']['dias_atras']}")
+    print(f"\n🧠 SCHEDULER CLASSIFICAÇÃO (independente):")
+    print(f"   Horário: {status['scheduler_classificacao']['horario']} (lote {status['scheduler_classificacao']['lote_maximo']}/dia)")
     
     print(f"\n🧠 MISTRAL (classificação IA):")
     if status['mistral']['configurado']:
@@ -283,6 +297,7 @@ __all__ = [
     'PNCPConfig',
     'MistralConfig',
     'SchedulerConfig',
+    'ClassificacaoSchedulerConfig',
     'ServerConfig',
     'LogConfig',
     'ModalidadesConfig',

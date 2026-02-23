@@ -30,6 +30,7 @@ from config import (
     SupabaseConfig,
     PNCPConfig,
     SchedulerConfig,
+    ClassificacaoSchedulerConfig,
     ServerConfig,
     LogConfig,
     ModalidadesConfig,
@@ -757,13 +758,12 @@ def atualizar_ultima_execucao():
         logger.error(f"❌ Erro ao atualizar última execução: {str(e)}")
 
 def tarefa_extracao_automatica():
-    """Tarefa executada pelo scheduler. Extração PNCP roda SEMPRE primeiro; classificação IA é opcional depois."""
+    """Tarefa do scheduler: SOMENTE extração PNCP. Não depende da Mistral; classificação roda em outro horário (17:00)."""
     agora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     modalidades = scheduler_config.get("modalidades", SchedulerConfig.MODALIDADES_PADRAO)
     dias_atras = scheduler_config.get("dias_atras", SchedulerConfig.DIAS_ATRAS)
     limite_paginas = scheduler_config.get("limite_paginas", SchedulerConfig.LIMITE_PAGINAS_AUTO)
 
-    # ---- Rich: início da rotina agendada (visível no Render) ----
     console.print()
     console.print(Panel.fit(
         f"[bold cyan]⏰ EXTRAÇÃO AUTOMÁTICA AGENDADA[/bold cyan]\n\n"
@@ -771,16 +771,14 @@ def tarefa_extracao_automatica():
         f"[yellow]Modalidades:[/yellow] {len(modalidades)} → {', '.join(map(str, modalidades))}\n"
         f"[yellow]Dias atrás:[/yellow] {dias_atras} | [yellow]Limite páginas:[/yellow] {limite_paginas or 'Sem limite'}",
         border_style="cyan",
-        title="[Scheduler]"
+        title="[Scheduler Extração]"
     ))
     console.print()
-    logger.info("⏰ Executando extração automática agendada...")
+    logger.info("⏰ Executando extração automática agendada (somente PNCP)...")
 
-    # Atualiza última execução no banco
     atualizar_ultima_execucao()
 
     try:
-        # 1) EXTRAÇÃO sempre roda primeiro (não depende da Mistral)
         resultado = processar_extracao(
             dias_atras=dias_atras,
             modalidades=modalidades,
@@ -789,45 +787,33 @@ def tarefa_extracao_automatica():
         total_salvos = resultado.get('total_salvos', 0)
         total_encontrados = resultado.get('total_encontrados', 0)
 
-        # ---- Rich: resumo da extração ----
         console.print()
         console.print(Panel.fit(
             f"[bold green]✅ EXTRAÇÃO AUTOMÁTICA CONCLUÍDA[/bold green]\n\n"
             f"[cyan]Encontrados:[/cyan] {total_encontrados}\n"
             f"[cyan]Salvos/atualizados:[/cyan] [bold]{total_salvos}[/bold]\n"
-            f"[cyan]Erros:[/cyan] {resultado.get('total_erros', 0)}",
+            f"[cyan]Erros:[/cyan] {resultado.get('total_erros', 0)}\n\n"
+            f"[dim]Classificação por IA roda em horário separado (17:00).[/dim]",
             border_style="green",
             title="[Resultado Extração]"
         ))
         console.print()
         logger.info(f"✅ Extração automática concluída: {total_salvos} registros salvos de {total_encontrados} encontrados")
 
-        # 2) Classificação por IA é OPCIONAL: só roda depois da extração
-        if total_salvos > 0 and MistralConfig.is_configured() and SUPABASE_ENABLED:
-            try:
-                console.print(Panel.fit(
-                    "[bold magenta]🧠 Iniciando classificação automática (Mistral)[/bold magenta]\n"
-                    "Lote: até 1000 licitações pendentes.",
-                    border_style="magenta",
-                    title="[Classificação IA]"
-                ))
-                console.print()
-                logger.info("🧠 Iniciando classificação automática de licitações (Mistral)...")
-                asyncio.run(tarefa_classificacao_automatica())
-            except Exception as e_class:
-                logger.error(f"❌ Erro na classificação automática (extração já concluída com sucesso): {str(e_class)}")
-                console.print(Panel.fit(f"[red]Erro na classificação: {e_class}[/red]\n[dim]Extração já concluída.[/dim]", border_style="red", title="[Aviso]"))
-        elif total_salvos > 0 and not MistralConfig.is_configured():
-            console.print(Panel.fit("[yellow]ℹ️ Classificação não executada: MISTRAL_API_KEY não configurada.[/yellow]\nExtração já concluída.", border_style="yellow", title="[Info]"))
-            logger.info("ℹ️ Classificação automática não executada: MISTRAL_API_KEY não configurada (extração já concluída)")
-        elif total_salvos == 0:
-            console.print(Panel.fit("[dim]Nenhum registro novo salvo; classificação automática não executada.[/dim]", border_style="dim", title="[Info]"))
-            logger.info("ℹ️ Nenhum registro novo salvo; classificação automática não executada.")
-
     except Exception as e:
         logger.error(f"❌ Erro na extração automática: {str(e)}")
         console.print(Panel.fit(f"[bold red]❌ Erro na extração automática[/bold red]\n\n{e}", border_style="red", title="[Erro]"))
         console.print()
+
+
+def job_classificacao_diaria():
+    """Job do scheduler: somente classificação (lote de 1000 pendentes). Roda às 17:00, independente da extração."""
+    logger.info("🧠 Executando classificação diária agendada (lote até 1000)...")
+    try:
+        asyncio.run(tarefa_classificacao_automatica())
+    except Exception as e:
+        logger.error(f"❌ Erro no job de classificação diária: {e}")
+        console.print(Panel.fit(f"[red]Erro: {e}[/red]", border_style="red", title="[Classificação Diária]"))
 
 async def tarefa_classificacao_automatica():
     """Tarefa de classificação automática - processa PENDENTES em lotes (ex.: 1000 por dia)"""
@@ -838,7 +824,7 @@ async def tarefa_classificacao_automatica():
             return
 
         classificador = ClassificadorIA(supabase)
-        LOTE_MAXIMO = 1000
+        LOTE_MAXIMO = ClassificacaoSchedulerConfig.LOTE_MAXIMO
 
         from classificador import SupabaseConfig
         response = supabase.table(SupabaseConfig.TABLE_NAME) \
@@ -945,16 +931,24 @@ def root():
 
 @app.get("/scheduler/status")
 def status_scheduler():
-    """Retorna status do scheduler"""
+    """Retorna status dos schedulers (extração e classificação)"""
     jobs = scheduler.get_jobs()
-    proxima = None
-    if jobs:
-        next_run = getattr(jobs[0], "next_run_time", None)
-        proxima = str(next_run) if next_run is not None else None
+    jobs_info = []
+    for j in jobs:
+        next_run = getattr(j, "next_run_time", None)
+        jobs_info.append({
+            "id": j.id,
+            "nome": j.name,
+            "proxima_execucao": str(next_run) if next_run is not None else None
+        })
     return {
         "scheduler_rodando": scheduler.running,
-        "configuracao": scheduler_config,
-        "proxima_execucao": proxima
+        "configuracao_extracao": scheduler_config,
+        "configuracao_classificacao": {
+            "horario": ClassificacaoSchedulerConfig.HORARIO,
+            "lote_maximo": ClassificacaoSchedulerConfig.LOTE_MAXIMO
+        },
+        "jobs": jobs_info
     }
 
 @app.post("/scheduler/configurar")
@@ -1375,15 +1369,12 @@ def startup_event():
     if SUPABASE_ENABLED:
         logger.info("✅ API pronta para uso com Supabase!")
         
-        # Carrega configuração do scheduler do banco
+        # 1) Scheduler de EXTRAÇÃO (horário do banco)
         logger.info("📥 Carregando configuração do scheduler do banco...")
         config_banco = carregar_config_scheduler_do_banco()
         
         if config_banco.get('id'):
-            # Atualiza configuração em memória
             scheduler_config.update(config_banco)
-            
-            # Se estava ativo, reativa o scheduler
             if config_banco.get('ativo'):
                 try:
                     partes = config_banco.get('horario', '06:00').strip().split(':')
@@ -1396,15 +1387,30 @@ def startup_event():
                         name='Extração Diária PNCP',
                         replace_existing=True
                     )
-                    
                     if not scheduler.running:
                         scheduler.start()
-                    
-                    logger.info(f"⏰ Scheduler ativado automaticamente: {config_banco['horario']}")
-                    logger.info(f"📋 Modalidades: {config_banco['modalidades']}")
-                    logger.info(f"📅 Dias atrás: {config_banco['dias_atras']}, Páginas: {config_banco['limite_paginas']}")
+                    logger.info(f"⏰ Scheduler EXTRAÇÃO ativado: {config_banco['horario']}")
+                    logger.info(f"📋 Modalidades: {config_banco['modalidades']}, Dias atrás: {config_banco['dias_atras']}")
                 except Exception as e:
-                    logger.error(f"❌ Erro ao ativar scheduler do banco: {str(e)}")
+                    logger.error(f"❌ Erro ao ativar scheduler de extração: {str(e)}")
+        
+        # 2) Scheduler de CLASSIFICAÇÃO (17:00, lote 1000) - independente da Mistral no momento da extração
+        try:
+            partes_class = ClassificacaoSchedulerConfig.HORARIO.strip().split(':')
+            h_class = int(partes_class[0]) if partes_class else 17
+            m_class = int(partes_class[1]) if len(partes_class) > 1 else 0
+            scheduler.add_job(
+                job_classificacao_diaria,
+                trigger=CronTrigger(hour=h_class, minute=m_class),
+                id='classificacao_diaria',
+                name='Classificação Diária (lote 1000)',
+                replace_existing=True
+            )
+            if not scheduler.running:
+                scheduler.start()
+            logger.info(f"🧠 Scheduler CLASSIFICAÇÃO ativado: {ClassificacaoSchedulerConfig.HORARIO} (lote {ClassificacaoSchedulerConfig.LOTE_MAXIMO})")
+        except Exception as e:
+            logger.error(f"❌ Erro ao ativar scheduler de classificação: {str(e)}")
     else:
         logger.warning("⚠️ API rodando em MODO TESTE (sem Supabase)")
         logger.warning("⚠️ Configurações do scheduler NÃO serão persistidas")
