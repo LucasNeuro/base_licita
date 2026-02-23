@@ -826,30 +826,31 @@ async def tarefa_classificacao_automatica():
         classificador = ClassificadorIA(supabase)
         LOTE_MAXIMO = ClassificacaoSchedulerConfig.LOTE_MAXIMO
 
+        # Buscar só o lote (sem count) para evitar timeout em tabela grande; use índice em subsetor_principal_id
         from classificador import SupabaseConfig
         response = supabase.table(SupabaseConfig.TABLE_NAME) \
-            .select("id", count='exact') \
+            .select("id") \
             .is_("subsetor_principal_id", "null") \
+            .limit(LOTE_MAXIMO) \
             .execute()
-        total_pendentes = response.count if hasattr(response, 'count') else 0
+        ids_pendentes = response.data or []
 
-        if total_pendentes == 0:
+        if not ids_pendentes:
             logger.info("🎉 Nenhuma licitação pendente de classificação")
             console.print(Panel.fit("[green]Nenhuma licitação pendente de classificação.[/green]", border_style="green", title="[Classificação]"))
             console.print()
             return
 
-        lote = min(LOTE_MAXIMO, total_pendentes)
+        lote = len(ids_pendentes)
         # ---- Rich: início classificação automática (visível no Render) ----
         console.print(Panel.fit(
             f"[bold magenta]CLASSIFICAÇÃO AUTOMÁTICA (Mistral)[/bold magenta]\n\n"
-            f"[cyan]Pendentes totais:[/cyan] {total_pendentes}\n"
-            f"[cyan]Lote desta execução:[/cyan] {lote}",
+            f"[cyan]Lote desta execução:[/cyan] {lote} (até {LOTE_MAXIMO}/dia)",
             border_style="magenta",
             title="[Início]"
         ))
         console.print()
-        logger.info(f"🧠 Iniciando classificação automática em lote: {lote} de {total_pendentes} licitações pendentes...")
+        logger.info(f"🧠 Iniciando classificação automática: {lote} licitações pendentes neste lote...")
 
         stats = await classificador.classificar_pendentes(limite=lote)
         logger.info(f"✅ Classificação automática (lote) concluída: {stats}")
