@@ -95,18 +95,33 @@ class ClassificadorIA:
             ))
             return stats
 
-        # 2. Buscar licitações pendentes ----------------------------------------
+        # 2. Buscar licitações pendentes em páginas de 1000
+        # (Supabase/PostgREST limita 1000 linhas por query por padrão)
+        BATCH = 1000
+        licitacoes: list = []
         try:
-            response = self.supabase.table(SupabaseConfig.TABLE_NAME) \
-                .select("id, objeto_compra, orgao_razao_social, modalidade_nome, itens") \
-                .is_("subsetor_principal_id", "null") \
-                .limit(limite) \
-                .execute()
+            offset = 0
+            while len(licitacoes) < limite:
+                buscar = min(BATCH, limite - len(licitacoes))
+                response = self.supabase.table(SupabaseConfig.TABLE_NAME) \
+                    .select("id, objeto_compra, orgao_razao_social, modalidade_nome, itens") \
+                    .is_("subsetor_principal_id", "null") \
+                    .range(offset, offset + buscar - 1) \
+                    .execute()
+                batch_data = response.data or []
+                if not batch_data:
+                    break
+                licitacoes.extend(batch_data)
+                offset += len(batch_data)
+                logger.info(
+                    "📦 Carregados %d/%d pendentes (página offset=%d)",
+                    len(licitacoes), limite, offset,
+                )
+                if len(batch_data) < buscar:
+                    break  # sem mais registros disponíveis
         except Exception as e:
             logger.error("Erro ao buscar licitações pendentes: %s", e)
             return stats
-
-        licitacoes = response.data or []
         if not licitacoes:
             console.print(Panel(
                 "[green]Nenhuma licitação pendente de classificação.[/green]",
