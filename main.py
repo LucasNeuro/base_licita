@@ -35,7 +35,7 @@ from config import (
     LogConfig,
     ModalidadesConfig,
     exibir_configuracoes,
-    MistralConfig
+    MistralConfig,
 )
 
 # Importar classificador
@@ -81,7 +81,7 @@ class ConfigScheduler(BaseModel):
     """Modelo para configurar o scheduler"""
     horario: str = "06:00"  # Formato HH:MM
     ativo: bool = True
-    modalidades: List[int] = [6, 8]  # Pregão Eletrônico e Dispensa
+    modalidades: List[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]  # Todas as modalidades
     dias_atras: int = 1  # Quantos dias para trás buscar
     limite_paginas: Optional[int] = None  # None = SEM LIMITE (busca tudo!)
     
@@ -98,26 +98,49 @@ class ExtrairManualRequest(BaseModel):
     uf: Optional[str] = None
     limite_paginas: Optional[int] = None  # None = SEM LIMITE (busca TUDO!)
     data_referencia: Optional[str] = None  # Formato YYYYMMDD, ex: "20241203"
+    buscar_detalhes: bool = False  # True = busca itens/docs/histórico por registro (muito mais lento)
+    tamanho_pagina: Optional[int] = None  # None = usa DEFAULT_PAGE_SIZE (500). Use 10 para testes rápidos.
     
     class Config:
         json_schema_extra = {
             "example": {
                 "dias_atras": 1,
-                "modalidades": None,  # None busca TODAS
+                "modalidades": [6],
                 "uf": None,
-                "limite_paginas": None,  # None = SEM LIMITE (busca TUDO!)
-                "data_referencia": None
+                "limite_paginas": 1,
+                "data_referencia": None,
+                "buscar_detalhes": False,
+                "tamanho_pagina": 10
             }
         }
 
 class ClassificarRequest(BaseModel):
     """Modelo para requisição de classificação manual"""
-    limite: int = 50  # Quantas licitações processar
-    
+    limite: int = 25000
+    paralelo: int = 5  # chamadas simultâneas à Mistral
+
     class Config:
         json_schema_extra = {
             "example": {
-                "limite": 50
+                "limite": 25000,
+                "paralelo": 5
+            }
+        }
+
+class ConfigClassificacaoScheduler(BaseModel):
+    """Modelo para configurar o scheduler de classificação"""
+    ativo: bool = True
+    horario: str = "17:00"         # HH:MM UTC
+    lote_maximo: int = 9000        # licitações por execução diária
+    paralelo: int = 5              # chamadas simultâneas à Mistral
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "ativo": True,
+                "horario": "17:00",
+                "lote_maximo": 9000,
+                "paralelo": 5
             }
         }
 
@@ -135,9 +158,17 @@ scheduler = BackgroundScheduler()
 scheduler_config = {
     "ativo": False,
     "horario": SchedulerConfig.HORARIO_PADRAO,
-    "modalidades": SchedulerConfig.MODALIDADES_PADRAO,
+    "modalidades": list(SchedulerConfig.MODALIDADES_PADRAO),  # todas: 1-13
     "dias_atras": SchedulerConfig.DIAS_ATRAS,
     "limite_paginas": None  # None = SEM LIMITE (busca tudo!)
+}
+
+# Configuração em memória do scheduler de classificação
+scheduler_classificacao_config = {
+    "ativo": True,
+    "horario": ClassificacaoSchedulerConfig.HORARIO,
+    "lote_maximo": ClassificacaoSchedulerConfig.LOTE_MAXIMO,
+    "paralelo": ClassificacaoSchedulerConfig.PARALELO,
 }
 
 # ============================================================================
@@ -173,7 +204,7 @@ def carregar_config_scheduler_do_banco() -> dict:
                 "id": config_db.get('id'),
                 "ativo": config_db.get('ativo', False),
                 "horario": horario,
-                "modalidades": scheduler_config.get('modalidades', [6, 8]),  # Usa do config padrão
+                "modalidades": scheduler_config.get('modalidades', SchedulerConfig.MODALIDADES_PADRAO),
                 "dias_atras": config_db.get('dias_retroativos', 1),
                 "limite_paginas": scheduler_config.get('limite_paginas', 50)  # Usa do config padrão
             }
@@ -267,35 +298,57 @@ def extrair_partes_numero_controle(numero_controle: str) -> tuple:
 
 def buscar_contratacoes_pncp(data_inicial: str, data_final: str, 
                               modalidade: int, uf: Optional[str] = None,
-                              pagina: int = 1) -> dict:
-    """Busca contratações na API de consulta do PNCP"""
-    
+                              pagina: int = 1,
+                              page_size: Optional[int] = None) -> dict:
+    """Busca contratações na API de consulta do PNCP com retry automático"""
+    import time
+
     endpoint = f"{PNCPConfig.CONSULTA_URL}/v1/contratacoes/publicacao"
     
+    tamanho = page_size if page_size and 1 <= page_size <= PNCPConfig.MAX_PAGE_SIZE else PNCPConfig.DEFAULT_PAGE_SIZE
+
     params = {
         'dataInicial': data_inicial,
         'dataFinal': data_final,
         'codigoModalidadeContratacao': modalidade,
         'pagina': pagina,
-        'tamanhoPagina': PNCPConfig.DEFAULT_PAGE_SIZE
+        'tamanhoPagina': tamanho,
     }
     
     # Só adiciona UF se for válido (não vazio, não "string", não None)
     if uf and uf.strip() and uf.lower() != "string" and len(uf) == 2:
         params['uf'] = uf.upper()
     
-    try:
-        response = requests.get(
-            endpoint, 
-            headers=PNCPConfig.HEADERS, 
-            params=params, 
-            timeout=PNCPConfig.REQUEST_TIMEOUT
-        )
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        logger.error(f"Erro ao buscar contratações: {str(e)}")
-        return {"data": [], "totalRegistros": 0}
+    max_tentativas = 3
+    for tentativa in range(1, max_tentativas + 1):
+        try:
+            response = requests.get(
+                endpoint, 
+                headers=PNCPConfig.HEADERS, 
+                params=params, 
+                timeout=PNCPConfig.REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.Timeout:
+            logger.warning(f"⏱️ Timeout na página {pagina} modalidade {modalidade} (tentativa {tentativa}/{max_tentativas})")
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else "?"
+            logger.warning(f"❌ HTTP {status} na página {pagina} modalidade {modalidade} (tentativa {tentativa}/{max_tentativas}): {e}")
+            # 404 ou 400 em geral significa que não há mais páginas — não retenta
+            if e.response is not None and e.response.status_code in (400, 404):
+                logger.info(f"ℹ️ API retornou {status} para página {pagina} — sem mais registros nesse intervalo")
+                return {"data": [], "totalRegistros": 0, "totalPaginas": 0}
+        except Exception as e:
+            logger.warning(f"⚠️ Erro inesperado na página {pagina} modalidade {modalidade} (tentativa {tentativa}/{max_tentativas}): {type(e).__name__}: {e}")
+        
+        if tentativa < max_tentativas:
+            espera = 2 ** tentativa  # backoff: 2s, 4s
+            logger.info(f"🔄 Aguardando {espera}s antes de retentar...")
+            time.sleep(espera)
+    
+    logger.error(f"🚫 Página {pagina} modalidade {modalidade} falhou após {max_tentativas} tentativas — pulando")
+    return {"data": [], "totalRegistros": 0, "totalPaginas": 0}
 
 def buscar_detalhes_completos(cnpj: str, ano: str, sequencial: str) -> dict:
     """Busca itens, documentos e histórico de uma contratação"""
@@ -438,15 +491,24 @@ def mapear_para_supabase(contratacao: dict, detalhes: dict) -> dict:
 def salvar_no_supabase(dados: dict) -> bool:
     """Salva ou atualiza licitação no Supabase (evita duplicatas e preserva dados existentes)"""
     
+    numero_controle = dados.get('numero_controle_pncp', 'N/A')
+    link = dados.get('link_portal_pncp') or ''
+    objeto = (dados.get('objeto_compra') or '')[:80]
+    orgao = dados.get('orgao_razao_social') or ''
+    uf = dados.get('uf_sigla') or ''
+    valor = dados.get('valor_total_estimado')
+    valor_txt = f"R$ {valor:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.') if valor else "N/I"
+
     if not SUPABASE_ENABLED:
-        # Modo teste - apenas loga
-        numero_controle = dados.get('numero_controle_pncp', 'N/A')
-        logger.info(f"🔵 [MODO TESTE] Salvaria: {numero_controle}")
+        logger.info(
+            f"🔵 [TESTE] {numero_controle} | {uf} | {valor_txt}\n"
+            f"         Objeto: {objeto}\n"
+            f"         Órgão:  {orgao}\n"
+            f"         Link:   {link or 'N/D'}"
+        )
         return True
     
     try:
-        numero_controle = dados['numero_controle_pncp']
-        
         # Verifica se já existe e busca dados_completos existente
         resultado = supabase.table(SupabaseConfig.TABLE_NAME)\
             .select('id, dados_completos')\
@@ -469,25 +531,30 @@ def salvar_no_supabase(dados: dict) -> bool:
                 .update(dados)\
                 .eq('numero_controle_pncp', numero_controle)\
                 .execute()
-            logger.info(f"✓ Atualizado: {numero_controle}")
+            logger.info(f"♻️  Atualizado: {numero_controle} | {uf} | {valor_txt} | {link or 'sem link'}")
         else:
             # Insere novo registro
             supabase.table(SupabaseConfig.TABLE_NAME)\
                 .insert(dados)\
                 .execute()
-            logger.info(f"✓ Inserido: {numero_controle}")
+            logger.info(f"✅ Inserido:   {numero_controle} | {uf} | {valor_txt} | {link or 'sem link'}")
         
         return True
         
     except Exception as e:
-        logger.error(f"❌ Erro ao salvar {dados.get('numero_controle_pncp')}: {str(e)}")
+        logger.error(f"❌ Erro ao salvar {numero_controle}: {str(e)}")
         return False
 
 def processar_extracao(dias_atras: int = 1, modalidades: List[int] = [6, 8], 
                        uf: Optional[str] = None, limite_paginas: int = 10,
-                       data_referencia: Optional[str] = None) -> dict:
+                       data_referencia: Optional[str] = None,
+                       buscar_detalhes: bool = False,
+                       tamanho_pagina: Optional[int] = None) -> dict:
     """Processa extração de licitações com visualização Rich"""
     
+    # Tamanho de página efetivo para esta execução
+    page_size = tamanho_pagina if tamanho_pagina and 1 <= tamanho_pagina <= PNCPConfig.MAX_PAGE_SIZE else PNCPConfig.DEFAULT_PAGE_SIZE
+
     # Calcula datas
     if data_referencia:
         try:
@@ -508,6 +575,8 @@ def processar_extracao(dias_atras: int = 1, modalidades: List[int] = [6, 8],
     # Painel de informações inicial
     sem_limite_geral = (limite_paginas == 0 or limite_paginas is None)
     limite_texto = "SEM LIMITE (busca TUDO! ♾️)" if sem_limite_geral else f"{limite_paginas} por modalidade"
+    detalhes_texto = "[green]SIM[/green] (itens + docs + histórico — mais lento)" if buscar_detalhes else "[yellow]NÃO[/yellow] (apenas listagem — rápido)"
+    max_registros_texto = f"~{limite_paginas * page_size}" if not sem_limite_geral else "todos"
     
     console.print()
     console.print(Panel.fit(
@@ -515,8 +584,9 @@ def processar_extracao(dias_atras: int = 1, modalidades: List[int] = [6, 8],
         f"[yellow]📅 Período:[/yellow] {data_inicial.strftime('%d/%m/%Y')} até {data_final.strftime('%d/%m/%Y')}\n"
         f"[yellow]📋 Modalidades:[/yellow] {len(modalidades)} ({', '.join(map(str, modalidades))})\n"
         f"[yellow]🗺️  UF:[/yellow] {uf if uf else 'Todos os estados'}\n"
-        f"[yellow]📄 Tamanho página:[/yellow] 50 registros\n"
-        f"[yellow]📊 Limite páginas:[/yellow] {limite_texto}",
+        f"[yellow]📄 Tamanho página:[/yellow] {page_size} registros\n"
+        f"[yellow]📊 Limite páginas:[/yellow] {limite_texto} (máx. {max_registros_texto} registros/modalidade)\n"
+        f"[yellow]🔍 Buscar detalhes:[/yellow] {detalhes_texto}",
         border_style="cyan",
         title="⚙️ Configuração"
     ))
@@ -531,6 +601,9 @@ def processar_extracao(dias_atras: int = 1, modalidades: List[int] = [6, 8],
         "total_erros": 0,
         "modalidades": {}
     }
+
+    # Acumula registros para exibir tabela de links ao final (útil no modo teste)
+    registros_extraidos: list = []
     
     # Progress bar com Rich
     with Progress(
@@ -573,33 +646,34 @@ def processar_extracao(dias_atras: int = 1, modalidades: List[int] = [6, 8],
                     data_final_str, 
                     modalidade, 
                     uf, 
-                    pagina
+                    pagina,
+                    page_size=page_size,
                 )
                 
                 contratacoes = resultado.get('data', [])
                 total_paginas = resultado.get('totalPaginas', 0)
-                total_registros = resultado.get('totalRegistros', 0)
+                # totalRegistros da API PNCP é o acumulado histórico (não o total do período).
+                # Usamos totalPaginas * page_size como estimativa real do período filtrado.
+                total_registros_periodo = total_paginas * page_size
                 
                 if not contratacoes:
-                    console.print(f"   [dim]Nenhum registro na página {pagina}[/dim]")
+                    console.print(f"   [dim]Nenhum registro na página {pagina} — encerrando modalidade[/dim]")
                     break
                 
                 # Cria task para esta modalidade na primeira página
-                if task_modalidade is None and total_registros > 0:
+                if task_modalidade is None and total_paginas > 0:
                     if sem_limite:
-                        max_registros = total_registros  # Busca TUDO
+                        max_registros = total_registros_periodo
                     else:
-                        max_registros = min(total_registros, limite_paginas * 50)
+                        max_registros = min(total_registros_periodo, limite_paginas * page_size)
                     
                     task_modalidade = progress.add_task(
                         f"   [green]Buscando {modalidade_nome}...",
-                        total=max_registros
+                        total=max(max_registros, 1)
                     )
                 
-                if sem_limite:
-                    console.print(f"   [dim]Página {pagina}/{total_paginas}: {len(contratacoes)} licitações[/dim]")
-                else:
-                    console.print(f"   [dim]Página {pagina}/{min(total_paginas, limite_paginas)}: {len(contratacoes)} licitações[/dim]")
+                paginas_limite = min(total_paginas, limite_paginas) if not sem_limite else total_paginas
+                console.print(f"   [dim]Página {pagina}/{paginas_limite}: {len(contratacoes)} licitações[/dim]")
                 
                 modalidade_stats["encontrados"] += len(contratacoes)
             
@@ -617,11 +691,25 @@ def processar_extracao(dias_atras: int = 1, modalidades: List[int] = [6, 8],
                         if not cnpj:
                             continue
                         
-                        # Busca detalhes completos
-                        detalhes = buscar_detalhes_completos(cnpj, ano, sequencial)
+                        # Busca detalhes (itens/docs/histórico) somente se solicitado
+                        # Desativado por padrão: cada registro requer 3 chamadas extras
+                        if buscar_detalhes:
+                            detalhes = buscar_detalhes_completos(cnpj, ano, sequencial)
+                        else:
+                            detalhes = {"itens": [], "documentos": [], "historico": []}
                         
                         # Mapeia para formato Supabase
                         dados_supabase = mapear_para_supabase(contratacao, detalhes)
+
+                        # Acumula para tabela de links exibida ao final
+                        registros_extraidos.append({
+                            "numero": dados_supabase.get("numero_controle_pncp", ""),
+                            "uf": dados_supabase.get("uf_sigla", ""),
+                            "modalidade": dados_supabase.get("modalidade_nome", ""),
+                            "objeto": (dados_supabase.get("objeto_compra") or "")[:60],
+                            "valor": dados_supabase.get("valor_total_estimado"),
+                            "link": dados_supabase.get("link_portal_pncp") or "",
+                        })
                         
                         # Salva no Supabase
                         if salvar_no_supabase(dados_supabase):
@@ -698,15 +786,57 @@ def processar_extracao(dias_atras: int = 1, modalidades: List[int] = [6, 8],
     
     console.print(tabela)
     console.print()
-    
+
+    # Tabela de editais extraídos com links — exibe até 50 para não poluir o log
+    if registros_extraidos:
+        modo_label = "[yellow]MODO TESTE — não salvo no banco[/yellow]" if not SUPABASE_ENABLED else "[green]SALVO NO SUPABASE[/green]"
+        exibir = registros_extraidos[:50]
+        tbl_links = Table(
+            title=f"🔗 Editais Extraídos ({len(registros_extraidos)} total) — {modo_label}",
+            box=box.SIMPLE,
+            show_header=True,
+            header_style="bold magenta",
+            show_lines=False,
+        )
+        tbl_links.add_column("#", style="dim", width=4, justify="right")
+        tbl_links.add_column("UF", width=4)
+        tbl_links.add_column("Modalidade", width=22, style="yellow")
+        tbl_links.add_column("Objeto", width=55, no_wrap=True)
+        tbl_links.add_column("Valor Estimado", width=16, justify="right", style="cyan")
+        tbl_links.add_column("Link Portal PNCP", style="blue")
+
+        for i, r in enumerate(exibir, 1):
+            valor = r.get("valor")
+            if valor:
+                valor_fmt = f"R$ {valor:,.0f}".replace(",", ".")
+            else:
+                valor_fmt = "[dim]N/I[/dim]"
+            link = r.get("link") or "[dim]sem link[/dim]"
+            tbl_links.add_row(
+                str(i),
+                r.get("uf", ""),
+                r.get("modalidade", ""),
+                r.get("objeto", ""),
+                valor_fmt,
+                link,
+            )
+
+        if len(registros_extraidos) > 50:
+            tbl_links.add_row("...", "", "", f"[dim]+ {len(registros_extraidos)-50} registros omitidos[/dim]", "", "")
+
+        console.print(tbl_links)
+        console.print()
+
     # Painel final
+    modo_aviso = "\n[bold yellow]⚠️  MODO TESTE — configure SUPABASE_URL e SUPABASE_KEY para salvar no banco![/bold yellow]" if not SUPABASE_ENABLED else ""
     console.print(Panel.fit(
         f"[bold green]✅ EXTRAÇÃO CONCLUÍDA COM SUCESSO![/bold green]\n\n"
         f"[cyan]📦 Total Encontrados:[/cyan] {estatisticas['total_encontrados']}\n"
         f"[cyan]✓ Total Salvos:[/cyan] [bold green]{estatisticas['total_salvos']}[/bold green]\n"
         f"[cyan]❌ Erros:[/cyan] {estatisticas['total_erros']}\n"
-        f"[cyan]📊 Taxa de Sucesso:[/cyan] {taxa_total}",
-        border_style="green",
+        f"[cyan]📊 Taxa de Sucesso:[/cyan] {taxa_total}"
+        f"{modo_aviso}",
+        border_style="green" if SUPABASE_ENABLED else "yellow",
         title="🎉 Resultado"
     ))
     console.print()
@@ -782,7 +912,8 @@ def tarefa_extracao_automatica():
         resultado = processar_extracao(
             dias_atras=dias_atras,
             modalidades=modalidades,
-            limite_paginas=limite_paginas
+            limite_paginas=limite_paginas,
+            buscar_detalhes=SchedulerConfig.BUSCAR_DETALHES,
         )
         total_salvos = resultado.get('total_salvos', 0)
         total_encontrados = resultado.get('total_encontrados', 0)
@@ -807,66 +938,54 @@ def tarefa_extracao_automatica():
 
 
 def job_classificacao_diaria():
-    """Job do scheduler: somente classificação (lote de 1000 pendentes). Roda às 17:00, independente da extração."""
-    logger.info("🧠 Executando classificação diária agendada (lote até 1000)...")
+    """Job do scheduler: classificação diária usando config em memória (scheduler_classificacao_config)."""
+    lote    = scheduler_classificacao_config.get("lote_maximo", ClassificacaoSchedulerConfig.LOTE_MAXIMO)
+    paralelo = scheduler_classificacao_config.get("paralelo",   ClassificacaoSchedulerConfig.PARALELO)
+    logger.info("🧠 Executando classificação diária agendada (lote=%d, paralelo=%d)...", lote, paralelo)
     try:
-        asyncio.run(tarefa_classificacao_automatica())
+        asyncio.run(tarefa_classificacao_automatica(lote=lote, paralelo=paralelo))
     except Exception as e:
-        logger.error(f"❌ Erro no job de classificação diária: {e}")
+        logger.error("❌ Erro no job de classificação diária: %s", e)
         console.print(Panel.fit(f"[red]Erro: {e}[/red]", border_style="red", title="[Classificação Diária]"))
 
-async def tarefa_classificacao_automatica():
-    """Tarefa de classificação automática - processa PENDENTES em lotes (ex.: 1000 por dia)"""
+async def tarefa_classificacao_automatica(
+    lote: int = ClassificacaoSchedulerConfig.LOTE_MAXIMO,
+    paralelo: int = ClassificacaoSchedulerConfig.PARALELO,
+):
+    """Classificação automática — processa até `lote` pendentes com `paralelo` chamadas simultâneas."""
     try:
         if not SUPABASE_ENABLED:
-            logger.warning("⚠️ Supabase não conectado - pulando classificação")
-            console.print(Panel.fit("[yellow]Supabase não conectado - classificação ignorada.[/yellow]", border_style="yellow", title="[Classificação]"))
+            logger.warning("⚠️ Supabase não conectado — pulando classificação")
+            console.print(Panel.fit(
+                "[yellow]Supabase não conectado — classificação ignorada.[/yellow]",
+                border_style="yellow", title="[Classificação]",
+            ))
             return
 
         classificador = ClassificadorIA(supabase)
-        LOTE_MAXIMO = ClassificacaoSchedulerConfig.LOTE_MAXIMO
 
-        # Buscar só o lote (sem count) para evitar timeout em tabela grande; use índice em subsetor_principal_id
-        from classificador import SupabaseConfig
-        response = supabase.table(SupabaseConfig.TABLE_NAME) \
-            .select("id") \
-            .is_("subsetor_principal_id", "null") \
-            .limit(LOTE_MAXIMO) \
-            .execute()
-        ids_pendentes = response.data or []
-
-        if not ids_pendentes:
-            logger.info("🎉 Nenhuma licitação pendente de classificação")
-            console.print(Panel.fit("[green]Nenhuma licitação pendente de classificação.[/green]", border_style="green", title="[Classificação]"))
-            console.print()
-            return
-
-        lote = len(ids_pendentes)
-        # ---- Rich: início classificação automática (visível no Render) ----
         console.print(Panel.fit(
             f"[bold magenta]CLASSIFICAÇÃO AUTOMÁTICA (Mistral)[/bold magenta]\n\n"
-            f"[cyan]Lote desta execução:[/cyan] {lote} (até {LOTE_MAXIMO}/dia)",
-            border_style="magenta",
-            title="[Início]"
+            f"[cyan]Lote:[/cyan]    {lote}\n"
+            f"[cyan]Paralelo:[/cyan] {paralelo} simultâneas",
+            border_style="magenta", title="[Início]",
         ))
         console.print()
-        logger.info(f"🧠 Iniciando classificação automática: {lote} licitações pendentes neste lote...")
 
-        stats = await classificador.classificar_pendentes(limite=lote)
-        logger.info(f"✅ Classificação automática (lote) concluída: {stats}")
-        # ---- Rich: resumo classificação automática ----
+        stats = await classificador.classificar_pendentes(limite=lote, paralelo=paralelo)
+        logger.info("✅ Classificação automática concluída: %s", stats)
+
         console.print()
         console.print(Panel.fit(
             f"[bold green]✅ CLASSIFICAÇÃO AUTOMÁTICA CONCLUÍDA[/bold green]\n\n"
             f"[cyan]Processados:[/cyan] {stats.get('processados', 0)}\n"
-            f"[cyan]Sucessos:[/cyan] {stats.get('sucessos', 0)}\n"
-            f"[cyan]Falhas:[/cyan] {stats.get('falhas', 0)}",
-            border_style="green",
-            title="[Resultado Classificação]"
+            f"[cyan]Sucessos:[/cyan]    {stats.get('sucessos', 0)}\n"
+            f"[cyan]Falhas:[/cyan]      {stats.get('falhas', 0)}",
+            border_style="green", title="[Resultado]",
         ))
         console.print()
     except Exception as e:
-        logger.error(f"❌ Erro na classificação automática: {str(e)}")
+        logger.error("❌ Erro na classificação automática: %s", e)
         console.print(Panel.fit(f"[bold red]Erro na classificação automática[/bold red]\n\n{e}", border_style="red", title="[Erro]"))
         console.print()
 
@@ -1139,8 +1258,10 @@ def extrair_manual(request: ExtrairManualRequest, background_tasks: BackgroundTa
             dias_atras=request.dias_atras,
             modalidades=modalidades,
             uf=uf_limpo,
-            limite_paginas=limite,  # None = sem limite
-            data_referencia=request.data_referencia
+            limite_paginas=limite,
+            data_referencia=request.data_referencia,
+            buscar_detalhes=request.buscar_detalhes,
+            tamanho_pagina=request.tamanho_pagina,
         )
         
         return {
@@ -1165,60 +1286,137 @@ def _verificar_config_classificacao():
 async def classificar_manual(request: ClassificarRequest, background_tasks: BackgroundTasks):
     """
     Classifica licitações manualmente usando IA (Mistral). Processa em background.
-    Requer MISTRAL_API_KEY configurada e Supabase com setores/subsetores.
+
+    - **limite**: quantas licitações processar (padrão 25.000 — ideal para zerar o estoque inicial)
+    - **paralelo**: chamadas simultâneas à Mistral (padrão 5)
+
+    **Para zerar o estoque de 175k em lotes de 25k:**
+    ```json
+    { "limite": 25000, "paralelo": 5 }
+    ```
+    Chame este endpoint repetidamente até que `/estatisticas` mostre `pendentes_classificacao = 0`.
     """
     ok, detail = _verificar_config_classificacao()
     if not ok:
         raise HTTPException(status_code=503, detail=detail)
-    
-    async def processar_background(limite: int):
+
+    async def processar_background(limite: int, paralelo: int):
         classificador = ClassificadorIA(supabase)
-        await classificador.classificar_pendentes(limite)
-        
-    background_tasks.add_task(processar_background, request.limite)
-    
+        await classificador.classificar_pendentes(limite=limite, paralelo=paralelo)
+
+    background_tasks.add_task(processar_background, request.limite, request.paralelo)
+
     return {
         "sucesso": True,
-        "mensagem": f"Classificação iniciada em background (limite={request.limite})"
+        "mensagem": f"Classificação iniciada em background",
+        "configuracao": {
+            "limite": request.limite,
+            "paralelo": request.paralelo,
+            "tempo_estimado": f"~{max(1, request.limite // request.paralelo)} seg",
+        }
     }
 
 @app.post("/classificar/todas", tags=["Classificação"])
-async def classificar_todas(background_tasks: BackgroundTasks):
+async def classificar_todas(background_tasks: BackgroundTasks, paralelo: int = 5):
     """
-    Classifica TODAS as licitações pendentes (subsetor_principal_id nulo) usando IA.
-    Processa em background, sem limite. Requer MISTRAL_API_KEY e Supabase.
+    Classifica TODAS as licitações pendentes de uma vez (sem limite de lote).
+    Processa em background. Use com cuidado — pode demorar horas para bases grandes.
+
+    - **paralelo**: chamadas simultâneas à Mistral (padrão 5)
     """
     ok, detail = _verificar_config_classificacao()
     if not ok:
         raise HTTPException(status_code=503, detail=detail)
-    
+
     async def processar_todas():
         classificador = ClassificadorIA(supabase)
-        
-        # Conta quantas licitações pendentes existem
-        response = supabase.table(SupabaseConfig.TABLE_NAME)\
-            .select("id", count='exact')\
-            .is_("subsetor_principal_id", "null")\
+
+        response = supabase.table(SupabaseConfig.TABLE_NAME) \
+            .select("id", count="exact") \
+            .is_("subsetor_principal_id", "null") \
             .execute()
-        
-        total_pendentes = response.count if hasattr(response, 'count') else 0
-        
+
+        total_pendentes = response.count if hasattr(response, "count") else 0
+
         if total_pendentes == 0:
             logger.info("🎉 Nenhuma licitação pendente de classificação")
             return
-            
+
         logger.info(f"🧠 Iniciando classificação de {total_pendentes} licitações pendentes...")
-        
-        # Processa TODAS as licitações pendentes
-        stats = await classificador.classificar_pendentes(limite=total_pendentes)
+        stats = await classificador.classificar_pendentes(limite=total_pendentes, paralelo=paralelo)
         logger.info(f"✅ Classificação concluída: {stats}")
-        
+
     background_tasks.add_task(processar_todas)
-    
+
     return {
         "sucesso": True,
-        "mensagem": "Classificação de TODAS as licitações iniciada em background"
+        "mensagem": "Classificação de TODAS as licitações pendentes iniciada em background",
+        "paralelo": paralelo,
     }
+
+@app.post("/scheduler/classificacao/configurar", tags=["Classificação"])
+def configurar_scheduler_classificacao(config: ConfigClassificacaoScheduler):
+    """
+    Ativa, desativa ou reconfigura o scheduler diário de classificação.
+
+    - **ativo**: True = ativa às `horario` todo dia | False = desativa
+    - **horario**: HH:MM UTC (padrão 17:00)
+    - **lote_maximo**: licitações classificadas por execução (padrão 9.000)
+    - **paralelo**: chamadas simultâneas à Mistral (padrão 5)
+
+    **Para manutenção diária (após zerar estoque):**
+    ```json
+    { "ativo": true, "horario": "17:00", "lote_maximo": 9000, "paralelo": 5 }
+    ```
+
+    **Para desativar temporariamente:**
+    ```json
+    { "ativo": false, "horario": "17:00", "lote_maximo": 9000, "paralelo": 5 }
+    ```
+    """
+    global scheduler_classificacao_config
+
+    scheduler_classificacao_config.update({
+        "ativo":       config.ativo,
+        "horario":     config.horario,
+        "lote_maximo": config.lote_maximo,
+        "paralelo":    config.paralelo,
+    })
+
+    # Remove job existente
+    if scheduler.get_job("classificacao_diaria"):
+        scheduler.remove_job("classificacao_diaria")
+
+    if config.ativo:
+        try:
+            h, m = config.horario.split(":")
+            scheduler.add_job(
+                job_classificacao_diaria,
+                trigger=CronTrigger(hour=int(h), minute=int(m)),
+                id="classificacao_diaria",
+                name=f"Classificação Diária (lote {config.lote_maximo})",
+                replace_existing=True,
+            )
+            if not scheduler.running:
+                scheduler.start()
+            logger.info(
+                "🧠 Scheduler classificação reconfigurado: %s | lote=%d | paralelo=%d",
+                config.horario, config.lote_maximo, config.paralelo,
+            )
+            return {
+                "sucesso": True,
+                "mensagem": f"Scheduler de classificação ativado para {config.horario} UTC",
+                "configuracao": scheduler_classificacao_config,
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    else:
+        logger.info("⏸️ Scheduler de classificação desativado")
+        return {
+            "sucesso": True,
+            "mensagem": "Scheduler de classificação desativado",
+            "configuracao": scheduler_classificacao_config,
+        }
 
 @app.get("/config")
 def ver_configuracoes():
@@ -1309,40 +1507,50 @@ def atualizar_configuracoes(config: ConfigGeral):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/estatisticas")
-def estatisticas():
-    """Retorna estatísticas da base de dados"""
-    
+def estatisticas(ultimos_dias: int = 30):
+    """
+    Retorna estatísticas da base de dados usando funções SQL agregadas.
+
+    Pré-requisito: execute o arquivo supabase_stats_functions.sql no
+    Supabase SQL Editor antes de usar este endpoint.
+
+    - **ultimos_dias**: janela para o gráfico de volume diário (padrão 30)
+    """
+
     if not SUPABASE_ENABLED:
         return {
             "aviso": "Supabase não configurado",
             "total_licitacoes": 0,
+            "pendentes_classificacao": 0,
+            "classificadas": 0,
             "por_modalidade": [],
-            "por_uf": []
+            "por_uf": [],
+            "por_dia": [],
         }
-    
+
     try:
-        # Total de licitações
-        total = supabase.table(SupabaseConfig.TABLE_NAME).select('id', count='exact').execute()
-        
-        # Por modalidade
-        por_modalidade = supabase.table(SupabaseConfig.TABLE_NAME)\
-            .select('modalidade_nome', count='exact')\
-            .execute()
-        
-        # Por UF
-        por_uf = supabase.table(SupabaseConfig.TABLE_NAME)\
-            .select('uf_sigla', count='exact')\
-            .execute()
-        
+        geral        = supabase.rpc("get_stats_geral").execute()
+        modalidades  = supabase.rpc("get_stats_modalidade").execute()
+        ufs          = supabase.rpc("get_stats_uf").execute()
+        por_dia      = supabase.rpc("get_stats_por_dia", {"ultimos_dias": ultimos_dias}).execute()
+
+        resumo = geral.data[0] if geral.data else {}
+
         return {
-            "total_licitacoes": total.count if hasattr(total, 'count') else 0,
-            "por_modalidade": por_modalidade.data[:10] if por_modalidade.data else [],
-            "por_uf": por_uf.data[:10] if por_uf.data else []
+            "total_licitacoes":          resumo.get("total_licitacoes", 0),
+            "pendentes_classificacao":   resumo.get("pendentes_classificacao", 0),
+            "classificadas":             resumo.get("classificadas", 0),
+            "por_modalidade":            modalidades.data or [],
+            "por_uf":                    ufs.data or [],
+            "por_dia":                   por_dia.data or [],
         }
-        
+
     except Exception as e:
         logger.error(f"Erro ao buscar estatísticas: {str(e)}")
-        return {"erro": str(e)}
+        return {
+            "erro": str(e),
+            "dica": "Execute supabase_stats_functions.sql no Supabase SQL Editor para criar as funções necessárias.",
+        }
 
 @app.get("/health/db")
 def health_db():

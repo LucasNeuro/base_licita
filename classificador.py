@@ -1,8 +1,17 @@
+"""
+Classificador de licitações em 2 etapas para suportar taxonomias grandes (100 setores / 1000 subsetores).
+
+Etapa 1 — Escolhe o SETOR  (~100 opções  → ~2.300 tokens de input)
+Etapa 2 — Escolhe o SUBSETOR dentro daquele setor (~10 opções → ~1.200 tokens de input)
+
+Custo estimado por licitação (open-mistral-7b, $0,25/1M tokens): ~$0,000875
+"""
+
 import json
 import logging
 import asyncio
 from datetime import datetime
-from typing import List, Dict, Optional, Any
+from typing import Dict, List, Optional
 from mistralai import Mistral
 from supabase import Client
 from rich.console import Console
@@ -11,319 +20,464 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeEl
 from rich.table import Table
 from rich import box
 
-from config import MistralConfig, SupabaseConfig
+from config import MistralConfig, SupabaseConfig, ClassificacaoSchedulerConfig
 
-# Configuração de logs
 logger = logging.getLogger(__name__)
 console = Console()
 
 
 class MistralUnauthorizedError(Exception):
-    """Erro 401 da Mistral: chave inválida ou expirada. Interrompe o lote de classificação."""
+    """Chave Mistral inválida (401). Interrompe o lote inteiro."""
     pass
 
+
 class ClassificadorIA:
-    """Classificador de licitações usando Mistral AI"""
-    
+    """Classificador de licitações em 2 etapas usando Mistral AI."""
+
     def __init__(self, supabase_client: Client):
         self.supabase = supabase_client
-        self.client = None
+        self.client: Optional[Mistral] = None
         self.model = MistralConfig.MODEL
-        # Mapa subsetor_id -> setor_id (preenchido ao carregar taxonomia; evita query extra ao salvar)
+
+        # Taxonomia carregada uma vez por instância
+        # _setores_texto  : texto formatado para o prompt da etapa 1 (lista de setores)
+        # _subsetores_por_setor : { setor_id: [ {id, nome, descricao} ] }
+        # _setor_nome     : { setor_id: nome }
+        # _subsetor_to_setor : { subsetor_id: setor_id }  (para salvar sem query extra)
+        self._setores_texto: str = ""
+        self._subsetores_por_setor: Dict[str, List[Dict]] = {}
+        self._setor_nome: Dict[str, str] = {}
         self._subsetor_to_setor: Dict[str, str] = {}
-        
+
         if MistralConfig.is_configured():
             try:
-                api_key = MistralConfig.API_KEY
-                # SDK Mistral envia no header: Authorization: Bearer <api_key>
-                self.client = Mistral(api_key=api_key)
-                logger.info("✅ Cliente Mistral AI inicializado (chave no header Authorization: %d caracteres)", len(api_key))
+                self.client = Mistral(api_key=MistralConfig.API_KEY)
+                logger.info(
+                    "✅ Cliente Mistral inicializado — modelo: %s | chave: %d chars",
+                    self.model, len(MistralConfig.API_KEY),
+                )
             except Exception as e:
-                logger.error(f"❌ Erro ao inicializar Mistral: {e}")
+                logger.error("❌ Erro ao inicializar Mistral: %s", e)
         else:
-            logger.warning("⚠️ Mistral AI não configurada (MISTRAL_API_KEY ausente ou vazia no ambiente)")
-    
-    async def classificar_pendentes(self, limite: int = 50) -> Dict[str, int]:
+            logger.warning("⚠️ Mistral não configurada (MISTRAL_API_KEY ausente)")
+
+    # =========================================================================
+    # Método principal
+    # =========================================================================
+
+    async def classificar_pendentes(
+        self,
+        limite: int = 50,
+        paralelo: int = ClassificacaoSchedulerConfig.PARALELO,
+    ) -> Dict[str, int]:
         """
-        Busca licitações sem classificação e processa com IA.
-        Exibe progresso com Rich no terminal (incl. Render).
-        Returns:
-            Dict com estatísticas (processados, sucessos, falhas)
+        Busca licitações sem classificação e processa com IA em 2 etapas paralelas.
+
+        Args:
+            limite:   Máximo de licitações a processar nesta rodada.
+            paralelo: Chamadas simultâneas à Mistral (semáforo).
         """
         if not self.client:
-            console.print(Panel("[red]Mistral não configurado (MISTRAL_API_KEY).[/red]", title="Classificação IA", border_style="red"))
-            return {"erro": "Mistral não configurado"}
+            console.print(Panel(
+                "[red]Mistral não configurada — configure MISTRAL_API_KEY.[/red]",
+                title="Classificação IA", border_style="red",
+            ))
+            return {"erro": "Mistral não configurada"}
 
         stats = {"processados": 0, "sucessos": 0, "falhas": 0}
 
-        # 1. Carregar taxonomia
-        setores_map = self._carregar_taxonomia()
-        if not setores_map:
-            console.print(Panel("[red]Não foi possível carregar taxonomia (setores/subsetores).[/red]", title="Classificação IA", border_style="red"))
-            logger.error("❌ Não foi possível carregar taxonomia de setores")
+        # 1. Carregar taxonomia ------------------------------------------------
+        ok = self._carregar_taxonomia()
+        if not ok:
+            console.print(Panel(
+                "[red]Não foi possível carregar taxonomia (tabela setores/subsetores vazia ou inacessível).[/red]",
+                title="Classificação IA", border_style="red",
+            ))
             return stats
 
-        # 2. Buscar licitações pendentes
+        # 2. Buscar licitações pendentes ----------------------------------------
         try:
-            response = self.supabase.table(SupabaseConfig.TABLE_NAME)\
-                .select("id, objeto_compra, orgao_razao_social, modalidade_nome, itens")\
-                .is_("subsetor_principal_id", "null")\
-                .limit(limite)\
+            response = self.supabase.table(SupabaseConfig.TABLE_NAME) \
+                .select("id, objeto_compra, orgao_razao_social, modalidade_nome, itens") \
+                .is_("subsetor_principal_id", "null") \
+                .limit(limite) \
                 .execute()
-            licitacoes = response.data
+        except Exception as e:
+            logger.error("Erro ao buscar licitações pendentes: %s", e)
+            return stats
 
-            if not licitacoes:
-                console.print(Panel("[green]Nenhuma licitação pendente de classificação.[/green]", title="Classificação IA", border_style="green"))
-                logger.info("🎉 Nenhuma licitação pendente de classificação")
-                return stats
-
-            total = len(licitacoes)
-            console.print()
-            console.print(Panel.fit(
-                f"[bold cyan]CLASSIFICAÇÃO DE LICITAÇÕES (IA)[/bold cyan]\n\n"
-                f"[yellow]Modelo:[/yellow] {self.model}\n"
-                f"[yellow]Total a processar:[/yellow] {total}\n"
-                f"[yellow]Taxonomia:[/yellow] setores/subsetores carregados",
-                border_style="cyan",
-                title="🧠 Iniciando"
+        licitacoes = response.data or []
+        if not licitacoes:
+            console.print(Panel(
+                "[green]Nenhuma licitação pendente de classificação.[/green]",
+                title="Classificação IA", border_style="green",
             ))
-            console.print()
+            return stats
 
-            # 3. Processar com barra de progresso Rich
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-                TextColumn("•"),
-                TextColumn("[cyan]{task.completed}/{task.total}[/cyan]"),
-                TimeElapsedColumn(),
-                console=console,
-            ) as progress:
-                task = progress.add_task("[cyan]Classificando...", total=total)
-                for licitacao in licitacoes:
-                    stats["processados"] += 1
+        total = len(licitacoes)
+        n_setores = len(self._setor_nome)
+        n_subsetores = len(self._subsetor_to_setor)
+
+        console.print()
+        console.print(Panel.fit(
+            f"[bold cyan]CLASSIFICAÇÃO EM 2 ETAPAS (IA)[/bold cyan]\n\n"
+            f"[yellow]Modelo:[/yellow]       {self.model}\n"
+            f"[yellow]Licitações:[/yellow]   {total}\n"
+            f"[yellow]Paralelo:[/yellow]     {paralelo} simultâneas\n"
+            f"[yellow]Taxonomia:[/yellow]    {n_setores} setores / {n_subsetores} subsetores\n"
+            f"[yellow]Etapa 1:[/yellow]      escolher setor  (~2.300 tokens)\n"
+            f"[yellow]Etapa 2:[/yellow]      escolher subsetor (~1.200 tokens)\n"
+            f"[yellow]Custo est.:[/yellow]   ~${total * 0.000875:.2f} ({total} × $0,000875)",
+            border_style="cyan",
+            title="🧠 Iniciando",
+        ))
+        console.print()
+
+        # 3. Processar em paralelo com semáforo --------------------------------
+        semaforo = asyncio.Semaphore(paralelo)
+        stop_event = asyncio.Event()   # sinaliza parada no 401
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("•"),
+            TextColumn("[cyan]{task.completed}/{task.total}[/cyan]"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task_id = progress.add_task("[cyan]Classificando...", total=total)
+
+            async def processar_uma(lic: Dict) -> None:
+                if stop_event.is_set():
+                    stats["falhas"] += 1
+                    progress.update(task_id, advance=1)
+                    return
+
+                async with semaforo:
+                    if stop_event.is_set():
+                        stats["falhas"] += 1
+                        progress.update(task_id, advance=1)
+                        return
                     try:
-                        prompt = self._montar_prompt(licitacao, setores_map)
-                        resposta_ia = await self._chamar_mistral(prompt)
-                        if resposta_ia:
-                            sucesso = self._salvar_classificacao(licitacao['id'], resposta_ia)
-                            if sucesso:
-                                stats["sucessos"] += 1
-                            else:
-                                stats["falhas"] += 1
+                        resultado = await self._classificar_em_2_etapas(lic)
+                        if resultado:
+                            ok = self._salvar_classificacao(lic["id"], resultado)
+                            stats["sucessos" if ok else "falhas"] += 1
                         else:
                             stats["falhas"] += 1
                     except MistralUnauthorizedError:
-                        logger.error("Classificação interrompida: chave Mistral inválida (401). Corrija MISTRAL_API_KEY no Render e faça redeploy.")
+                        stop_event.set()
+                        stats["falhas"] += 1
                         console.print(Panel.fit(
-                            "[red]Classificação interrompida: MISTRAL_API_KEY inválida (401).[/red]\n"
-                            "Corrija a chave no Render (Environment) e faça redeploy.",
-                            border_style="red",
-                            title="[Mistral 401]"
+                            "[red]Classificação interrompida: MISTRAL_API_KEY inválida (401).\n"
+                            "Corrija a chave e reinicie.[/red]",
+                            border_style="red", title="[Mistral 401]",
                         ))
-                        stats["falhas"] += 1
-                        progress.update(task, advance=1)
-                        break
                     except Exception as e:
-                        logger.error(f"Erro ao classificar licitação {licitacao.get('id')}: {e}")
+                        logger.error("Erro ao classificar %s: %s", lic.get("id"), e)
                         stats["falhas"] += 1
-                    progress.update(task, advance=1)
+                    finally:
+                        stats["processados"] += 1
+                        progress.update(task_id, advance=1)
 
-            # 4. Resumo em tabela Rich
-            tabela = Table(title="Resumo da classificação", box=box.ROUNDED, show_header=True, header_style="bold cyan")
-            tabela.add_column("Métrica", style="yellow", width=20)
-            tabela.add_column("Valor", justify="right", style="green")
-            tabela.add_row("Processados", str(stats["processados"]))
-            tabela.add_row("Sucessos", f"[bold green]{stats['sucessos']}[/bold green]")
-            tabela.add_row("Falhas", f"[red]{stats['falhas']}[/red]" if stats["falhas"] else "0")
-            taxa = f"{(stats['sucessos']/total*100):.1f}%" if total else "0%"
-            tabela.add_row("Taxa sucesso", taxa)
-            console.print()
-            console.print(tabela)
-            console.print()
-            console.print(Panel.fit(
-                f"[bold green]Classificação concluída.[/bold green]\n"
-                f"Processados: {stats['processados']} | Sucessos: {stats['sucessos']} | Falhas: {stats['falhas']}",
-                border_style="green",
-                title="✅ Fim"
-            ))
-            console.print()
-            logger.info(f"✅ Classificação concluída: {stats}")
+            await asyncio.gather(*[processar_uma(lic) for lic in licitacoes])
 
-        except Exception as e:
-            logger.error(f"Erro no fluxo de classificação: {e}")
-            console.print(Panel(f"[red]Erro: {e}[/red]", title="Classificação IA", border_style="red"))
-
+        # 4. Resumo -----------------------------------------------------------
+        taxa = f"{(stats['sucessos'] / total * 100):.1f}%" if total else "0%"
+        tbl = Table(title="Resumo da classificação", box=box.ROUNDED, header_style="bold cyan")
+        tbl.add_column("Métrica",  style="yellow", width=20)
+        tbl.add_column("Valor",    justify="right", style="green")
+        tbl.add_row("Processados", str(stats["processados"]))
+        tbl.add_row("Sucessos",    f"[bold green]{stats['sucessos']}[/bold green]")
+        tbl.add_row("Falhas",      f"[red]{stats['falhas']}[/red]" if stats["falhas"] else "0")
+        tbl.add_row("Taxa",        taxa)
+        console.print()
+        console.print(tbl)
+        console.print(Panel.fit(
+            f"[bold green]Classificação concluída.[/bold green]  "
+            f"Processados: {stats['processados']} | Sucessos: {stats['sucessos']} | Falhas: {stats['falhas']}",
+            border_style="green", title="✅ Fim",
+        ))
+        console.print()
+        logger.info("✅ Classificação concluída: %s", stats)
         return stats
 
-    def _carregar_taxonomia(self) -> str:
-        """Carrega lista de setores/subsetores formatada para o prompt e mapa subsetor_id -> setor_id."""
+    # =========================================================================
+    # Etapas de classificação
+    # =========================================================================
+
+    async def _classificar_em_2_etapas(self, licitacao: Dict) -> Optional[Dict]:
+        """
+        Etapa 1: identifica o setor.
+        Etapa 2: identifica o subsetor dentro do setor escolhido.
+        Retorna dict com subsetor_id, setor_id, confianca, justificativa ou None em caso de falha.
+        """
+        contexto = self._montar_contexto_licitacao(licitacao)
+
+        # --- Etapa 1: setor --------------------------------------------------
+        prompt_setor = self._prompt_etapa1(contexto)
+        resp1 = await self._chamar_mistral(prompt_setor)
+        if not resp1:
+            logger.warning("Etapa 1 falhou para licitação %s", licitacao.get("id"))
+            return None
+
+        setor_id = str(resp1.get("setor_id", "")).strip()
+        if not setor_id or setor_id not in self._subsetores_por_setor:
+            logger.warning(
+                "setor_id '%s' inválido na etapa 1 (licitação %s). "
+                "Setores válidos: %s",
+                setor_id, licitacao.get("id"),
+                list(self._subsetores_por_setor.keys())[:5],
+            )
+            return None
+
+        # --- Etapa 2: subsetor -----------------------------------------------
+        subsetores_do_setor = self._subsetores_por_setor[setor_id]
+        prompt_subsetor = self._prompt_etapa2(contexto, setor_id, subsetores_do_setor)
+        resp2 = await self._chamar_mistral(prompt_subsetor)
+        if not resp2:
+            logger.warning("Etapa 2 falhou para licitação %s", licitacao.get("id"))
+            return None
+
+        subsetor_id = str(resp2.get("subsetor_id", "")).strip()
+        validos = {str(s["id"]) for s in subsetores_do_setor}
+        if not subsetor_id or subsetor_id not in validos:
+            logger.warning(
+                "subsetor_id '%s' inválido na etapa 2 (licitação %s).",
+                subsetor_id, licitacao.get("id"),
+            )
+            return None
+
+        return {
+            "setor_id":      setor_id,
+            "subsetor_id":   subsetor_id,
+            "confianca":     float(resp2.get("confianca", resp1.get("confianca", 0.0))),
+            "justificativa": (resp2.get("justificativa") or resp1.get("justificativa") or "")[:2000],
+        }
+
+    # =========================================================================
+    # Taxonomia
+    # =========================================================================
+
+    def _carregar_taxonomia(self) -> bool:
+        """
+        Carrega setores e subsetores do Supabase e monta estruturas para os prompts.
+        Retorna True se carregou com sucesso.
+        """
         try:
-            # Busca subsetores ativos com setor_id e nome do setor (evita segunda query ao salvar)
-            response = self.supabase.table("subsetores")\
-                .select("id, nome, descricao, setor_id, setores(nome)")\
-                .eq("ativo", True)\
+            # --- Setores -------------------------------------------------------
+            resp_setores = self.supabase.table("setores") \
+                .select("id, nome, descricao") \
+                .eq("ativo", True) \
                 .execute()
-                
-            subsetores = response.data
-            
+            setores = resp_setores.data or []
+
+            if not setores:
+                logger.error("Tabela 'setores' vazia ou inacessível.")
+                return False
+
+            self._setor_nome = {str(s["id"]): s["nome"] for s in setores}
+
+            # Texto da etapa 1: "ID: uuid | SETOR: nome - descrição"
+            linhas_setores = []
+            for s in setores:
+                desc = f" - {s['descricao']}" if s.get("descricao") else ""
+                linhas_setores.append(f"ID: {s['id']} | {s['nome']}{desc}")
+            self._setores_texto = "\n".join(linhas_setores)
+
+            # --- Subsetores ----------------------------------------------------
+            resp_sub = self.supabase.table("subsetores") \
+                .select("id, nome, descricao, setor_id") \
+                .eq("ativo", True) \
+                .execute()
+            subsetores = resp_sub.data or []
+
             if not subsetores:
-                self._subsetor_to_setor = {}
+                logger.error("Tabela 'subsetores' vazia ou inacessível.")
+                return False
+
+            self._subsetor_to_setor = {}
+            self._subsetores_por_setor = {}
+
+            for sub in subsetores:
+                sid = str(sub["id"])
+                setor_id = str(sub["setor_id"])
+                self._subsetor_to_setor[sid] = setor_id
+                self._subsetores_por_setor.setdefault(setor_id, []).append(sub)
+
+            logger.info(
+                "✅ Taxonomia carregada: %d setores / %d subsetores",
+                len(setores), len(subsetores),
+            )
+            return True
+
+        except Exception as e:
+            logger.error("Erro ao carregar taxonomia: %s", e)
+            return False
+
+    # =========================================================================
+    # Prompts
+    # =========================================================================
+
+    def _montar_contexto_licitacao(self, licitacao: Dict) -> str:
+        itens_texto = ""
+        itens = licitacao.get("itens")
+        if isinstance(itens, list) and itens:
+            itens_texto = "\n".join(
+                f"- {it.get('descricao', '')}" for it in itens[:5]
+            )
+        return (
+            f"OBJETO: {licitacao.get('objeto_compra')}\n"
+            f"ÓRGÃO: {licitacao.get('orgao_razao_social')}\n"
+            f"MODALIDADE: {licitacao.get('modalidade_nome')}\n"
+            f"ITENS PRINCIPAIS:\n{itens_texto}"
+        )
+
+    def _prompt_etapa1(self, contexto: str) -> str:
+        """Etapa 1 — escolher o SETOR mais adequado."""
+        return (
+            "Você é um especialista em licitações públicas brasileiras.\n"
+            "Analise a licitação e escolha o SETOR mais adequado da lista.\n\n"
+            f"LICITAÇÃO:\n{contexto}\n\n"
+            f"SETORES DISPONÍVEIS:\n{self._setores_texto}\n\n"
+            "Retorne APENAS um JSON válido:\n"
+            "{\n"
+            '  "setor_id": "UUID_DO_SETOR",\n'
+            '  "confianca": 0.90,\n'
+            '  "justificativa": "Motivo em 1 frase."\n'
+            "}"
+        )
+
+    def _prompt_etapa2(self, contexto: str, setor_id: str, subsetores: List[Dict]) -> str:
+        """Etapa 2 — escolher o SUBSETOR dentro do setor já identificado."""
+        setor_nome = self._setor_nome.get(setor_id, setor_id)
+        linhas = []
+        for s in subsetores:
+            desc = f" - {s['descricao']}" if s.get("descricao") else ""
+            linhas.append(f"ID: {s['id']} | {s['nome']}{desc}")
+        lista_subsetores = "\n".join(linhas)
+
+        return (
+            "Você é um especialista em licitações públicas brasileiras.\n"
+            f"O setor já foi identificado como: {setor_nome}.\n"
+            "Agora escolha o SUBSETOR mais específico da lista abaixo.\n\n"
+            f"LICITAÇÃO:\n{contexto}\n\n"
+            f"SUBSETORES DE '{setor_nome}':\n{lista_subsetores}\n\n"
+            "Retorne APENAS um JSON válido:\n"
+            "{\n"
+            '  "subsetor_id": "UUID_DO_SUBSETOR",\n'
+            '  "confianca": 0.95,\n'
+            '  "justificativa": "Motivo em 1 ou 2 frases."\n'
+            "}"
+        )
+
+    # =========================================================================
+    # Chamada Mistral com retry
+    # =========================================================================
+
+    async def _chamar_mistral(self, prompt: str, max_tentativas: int = 3) -> Optional[Dict]:
+        """Envia prompt para Mistral com retry para rate limit (429) e erros transitórios."""
+        for tentativa in range(1, max_tentativas + 1):
+            try:
+                resp = await self.client.chat.complete_async(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format={"type": "json_object"},
+                    temperature=MistralConfig.TEMPERATURE,
+                )
+                return json.loads(resp.choices[0].message.content)
+
+            except Exception as e:
+                msg = str(e)
+
+                if "401" in msg or "Unauthorized" in msg:
+                    logger.error(
+                        "MISTRAL_API_KEY inválida (401). "
+                        "Gere nova chave em https://console.mistral.ai/"
+                    )
+                    raise MistralUnauthorizedError("401 Unauthorized") from e
+
+                if "429" in msg or "rate" in msg.lower() or "too many" in msg.lower():
+                    espera = 5 * (2 ** (tentativa - 1))  # 5s → 10s → 20s
+                    logger.warning(
+                        "⏳ Rate limit Mistral (429) — aguardando %ds (tentativa %d/%d)",
+                        espera, tentativa, max_tentativas,
+                    )
+                    await asyncio.sleep(espera)
+                    continue
+
+                if tentativa < max_tentativas:
+                    await asyncio.sleep(2)
+                    continue
+
+                logger.error("Erro na chamada Mistral após %d tentativas: %s", max_tentativas, e)
                 return None
 
-            # Mapa para obter setor_id ao salvar, sem nova requisição ao Supabase
-            self._subsetor_to_setor = {str(sub["id"]): str(sub["setor_id"]) for sub in subsetores if sub.get("setor_id")}
-                
-            # Formata para texto: "ID: Nome (Setor) - Descrição"
-            lista_texto = []
-            for sub in subsetores:
-                setor_nome = sub['setores']['nome'] if sub.get('setores') else "Geral"
-                desc = f" - {sub['descricao']}" if sub.get('descricao') else ""
-                
-                linha = f"ID: {sub['id']} | SETOR: {setor_nome} -> {sub['nome']}{desc}"
-                lista_texto.append(linha)
-                
-            return "\n".join(lista_texto)
-            
-        except Exception as e:
-            logger.error(f"Erro ao carregar taxonomia: {e}")
-            self._subsetor_to_setor = {}
-            return None
+        return None
 
-    def _montar_prompt(self, licitacao: Dict, taxonomia: str) -> str:
-        """Cria o prompt para a IA"""
-        
-        # Resumo dos itens (primeiros 5 para não estourar token)
-        itens_texto = ""
-        if licitacao.get('itens'):
-            itens_lista = licitacao['itens']
-            if isinstance(itens_lista, list):
-                resumo_itens = [f"- {item.get('descricao', '')}" for item in itens_lista[:5]]
-                itens_texto = "\n".join(resumo_itens)
-        
-        texto_licitacao = f"""
-        OBJETO: {licitacao.get('objeto_compra')}
-        ÓRGÃO: {licitacao.get('orgao_razao_social')}
-        MODALIDADE: {licitacao.get('modalidade_nome')}
-        ITENS PRINCIPAIS:
-        {itens_texto}
-        """
-        
-        prompt = f"""
-        Você é um especialista em classificação de licitações públicas.
-        Sua tarefa é analisar a licitação abaixo e escolher o MELHOR subsetor para ela na lista fornecida.
-        
-        DADOS DA LICITAÇÃO:
-        {texto_licitacao}
-        
-        LISTA DE SUBSETORES (Use APENAS um destes IDs):
-        {taxonomia}
-        
-        INSTRUÇÕES:
-        1. Analise o objeto e os itens.
-        2. Escolha o subsetor mais específico que se aplica.
-        3. Retorne APENAS um JSON no seguinte formato, sem explicações adicionais:
-        {{
-            "subsetor_id": "UUID_DO_SUBSETOR_ESCOLHIDO",
-            "confianca": 0.95,
-            "justificativa": "Breve explicação em 1 ou 2 frases do porquê deste subsetor para esta licitação."
-        }}
-        O campo justificativa é obrigatório e será salvo no banco.
-        """
-        return prompt
-
-    async def _chamar_mistral(self, prompt: str) -> Optional[Dict]:
-        """Envia prompt para Mistral e faz parse do JSON"""
-        try:
-            chat_response = await self.client.chat.complete_async(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    },
-                ],
-                response_format={"type": "json_object"},
-                temperature=MistralConfig.TEMPERATURE,
-            )
-            
-            conteudo = chat_response.choices[0].message.content
-            return json.loads(conteudo)
-            
-        except Exception as e:
-            msg = str(e)
-            if "401" in msg or "Unauthorized" in msg:
-                logger.error(
-                    "💡 MISTRAL_API_KEY inválida ou expirada. No Render: Environment → MISTRAL_API_KEY. "
-                    "Gere uma nova chave em https://console.mistral.ai/ e cole sem espaços."
-                )
-                raise MistralUnauthorizedError("Mistral retornou 401 Unauthorized") from e
-            logger.error(f"Erro na chamada Mistral: {e}")
-            return None
+    # =========================================================================
+    # Salvar classificação (sem query extra)
+    # =========================================================================
 
     def _salvar_classificacao(self, licitacao_id: str, resultado: Dict) -> bool:
-        """Salva o resultado no Supabase"""
+        """
+        Salva a classificação em licitacoes_classificacao e atualiza licitacoes.
+        Usa o retorno do upsert para obter o id — sem SELECT extra.
+        """
         try:
-            subsetor_id = resultado.get("subsetor_id")
-            confianca = resultado.get("confianca", 0.0)
-            justificativa = resultado.get("justificativa") or ""
-            if isinstance(justificativa, str) and len(justificativa) > 2000:
-                justificativa = justificativa[:2000]
-            
-            if not subsetor_id:
+            subsetor_id   = str(resultado.get("subsetor_id", "")).strip()
+            setor_id      = str(resultado.get("setor_id", "")).strip()
+            confianca     = float(resultado.get("confianca", 0.0))
+            justificativa = (resultado.get("justificativa") or "")[:2000]
+
+            if not subsetor_id or not setor_id:
+                logger.warning("Resultado sem subsetor_id ou setor_id para licitacao %s", licitacao_id)
                 return False
 
-            # 1. Obter setor_id do mapa carregado na taxonomia (evita query extra e 406/PGRST116)
-            subsetor_id_str = str(subsetor_id).strip()
-            setor_id = self._subsetor_to_setor.get(subsetor_id_str)
-            if not setor_id:
+            # Valida contra taxonomia carregada
+            if subsetor_id not in self._subsetor_to_setor:
                 logger.error(
-                    "Subsetor retornado pela IA não está na taxonomia carregada: %s. "
-                    "Ignore se a IA devolveu ID inválido; caso contrário, confira a tabela subsetores no Supabase.",
-                    subsetor_id_str,
+                    "subsetor_id '%s' não existe na taxonomia (licitacao %s).",
+                    subsetor_id, licitacao_id,
                 )
                 return False
-            
-            # 2. Inserir na tabela de vínculo (upsert), incluindo justificativa/descrição
-            dados_vinculo = {
+
+            dados_vinculo: Dict = {
                 "licitacao_id": licitacao_id,
-                "setor_id": setor_id,
-                "subsetor_id": subsetor_id,
-                "confianca": confianca,
-                "origem": "mistral_ai",
-                "updated_at": datetime.now().isoformat()
+                "setor_id":     setor_id,
+                "subsetor_id":  subsetor_id,
+                "confianca":    confianca,
+                "origem":       "mistral_ai",
+                "updated_at":   datetime.now().isoformat(),
             }
             if justificativa:
                 dados_vinculo["justificativa"] = justificativa
-            
-            # Upsert na tabela de classificação
-            self.supabase.table("licitacoes_classificacao")\
-                .upsert(dados_vinculo, on_conflict="licitacao_id, subsetor_id")\
+
+            # Upsert retorna o registro — evita SELECT extra
+            resp_upsert = self.supabase.table("licitacoes_classificacao") \
+                .upsert(dados_vinculo, on_conflict="licitacao_id, subsetor_id") \
                 .execute()
-                
-            # 3. Atualizar licitação principal (atalho)
-            # Primeiro buscamos o ID da classificação recém criada/atualizada
-            resp_class = self.supabase.table("licitacoes_classificacao")\
-                .select("id")\
-                .eq("licitacao_id", licitacao_id)\
-                .eq("subsetor_id", subsetor_id)\
-                .single().execute()
-                
-            if resp_class.data:
-                classificacao_id = resp_class.data["id"]
-                
-                self.supabase.table("licitacoes").update({
-                    "classificacao_principal_id": classificacao_id,
-                    "setor_principal_id": setor_id,
-                    "subsetor_principal_id": subsetor_id
-                }).eq("id", licitacao_id).execute()
-                
-                logger.info(f"✅ Licitação {licitacao_id} classificada: {subsetor_id} ({confianca})")
-                return True
-                
-            return False
-            
+
+            classificacao_id = resp_upsert.data[0]["id"] if resp_upsert.data else None
+            if not classificacao_id:
+                logger.error("Upsert não retornou id para licitacao %s", licitacao_id)
+                return False
+
+            # Atualiza atalhos na tabela principal
+            self.supabase.table("licitacoes").update({
+                "classificacao_principal_id": classificacao_id,
+                "setor_principal_id":         setor_id,
+                "subsetor_principal_id":      subsetor_id,
+            }).eq("id", licitacao_id).execute()
+
+            logger.info(
+                "✅ Classificado: %s → setor=%s subsetor=%s confiança=%.2f",
+                licitacao_id, setor_id, subsetor_id, confianca,
+            )
+            return True
+
         except Exception as e:
-            logger.error(f"Erro ao salvar classificação: {e}")
+            logger.error("Erro ao salvar classificação para %s: %s", licitacao_id, e)
             return False

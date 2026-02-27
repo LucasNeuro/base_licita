@@ -70,8 +70,8 @@ class PNCPConfig:
     # Tamanho máximo de página (conforme API)
     MAX_PAGE_SIZE = 500
     
-    # Tamanho padrão de página (recomendado pela API)
-    DEFAULT_PAGE_SIZE = 50
+    # Tamanho padrão de página — usa o máximo para minimizar requisições e pontos de falha
+    DEFAULT_PAGE_SIZE = 500
 
 # ============================================================================
 # CONFIGURAÇÕES DO SCHEDULER
@@ -101,26 +101,33 @@ class SchedulerConfig:
     # Horário padrão para extração diária (formato HH:MM)
     HORARIO_PADRAO = os.getenv("HORARIO_EXTRACAO", "06:00")
     
-    # Modalidades padrão para extração automática
-    # 6 = Pregão Eletrônico, 8 = Dispensa de Licitação
-    MODALIDADES_PADRAO = [6, 8]
+    # Modalidades padrão para extração automática — todas as disponíveis no PNCP
+    MODALIDADES_PADRAO = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     
     # Quantidade de dias para trás na extração automática
     DIAS_ATRAS = 1
     
-    # Limite de páginas na extração automática
-    LIMITE_PAGINAS_AUTO = 50
-    
+    # Limite de páginas na extração automática (None = sem limite)
+    LIMITE_PAGINAS_AUTO = None
+
     # Limite de páginas na extração manual (padrão)
     LIMITE_PAGINAS_MANUAL = 10
 
+    # Buscar detalhes por licitação (itens + documentos + histórico)?
+    # True  = 3 chamadas extras por registro (mais dados, muito mais lento)
+    # False = apenas dados da listagem (rápido — recomendado para volume alto)
+    BUSCAR_DETALHES = os.getenv("BUSCAR_DETALHES", "false").lower() == "true"
+
 
 class ClassificacaoSchedulerConfig:
-    """Scheduler só de classificação (independente da extração). Roda em horário fixo, lote de 1000."""
-    # Horário diário (HH:MM) - ex.: 17:00
+    """Scheduler de classificação por IA — independente da extração."""
+    # Horário diário (HH:MM)
     HORARIO = os.getenv("HORARIO_CLASSIFICACAO", "17:00")
-    # Tamanho do lote por execução
-    LOTE_MAXIMO = int(os.getenv("CLASSIFICACAO_LOTE", "1000") or "1000")
+    # Lote por execução — 9000 cobre o fluxo diário normal (700-1400 novos/dia)
+    # Para zerar o estoque inicial, chame /classificar/todas manualmente
+    LOTE_MAXIMO = int(os.getenv("CLASSIFICACAO_LOTE", "9000") or "9000")
+    # Chamadas simultâneas à Mistral (semáforo) — 5 é seguro para qualquer plano
+    PARALELO = int(os.getenv("CLASSIFICACAO_PARALELO", "5") or "5")
 
 # ============================================================================
 # CONFIGURAÇÕES DO SERVIDOR
@@ -303,6 +310,6 @@ __all__ = [
     'LogConfig',
     'ModalidadesConfig',
     'validar_configuracoes',
-    'exibir_configuracoes'
+    'exibir_configuracoes',
 ]
 
